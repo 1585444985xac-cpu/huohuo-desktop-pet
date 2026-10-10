@@ -1,0 +1,41 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust / Tauri 构建产物。体积可达 GB 级（本项目曾累积到 17 GB），务必不要入库。
+# 与 src-tauri/.gitignore 里的 /target/ 重复，保留是为了在仓库根目录
+# 不是本目录时依然生效。
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# 私钥一律不进仓库。qweather_ed25519_*.pem 是早期方案的遗留文件（代码里已无引用），
+# 但既然是私钥就挡在门外 —— 文件本身还留在本机。
+*.pem
+
+# Live2D 模型：模型自带的使用说明写明「版权归 miHoYo」且**禁止二次分发**，
+# 所以不进仓库（克隆后需自备），见 public/model/README.md。
+public/model/character/
+
+# 编码抢修时留下的损坏副本（*.bak / *.mojibake*），不是源码
+*.bak
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

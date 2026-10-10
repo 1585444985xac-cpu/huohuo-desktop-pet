@@ -1,0 +1,181 @@
+// 用 CDP 把桌宠界面真渲染出来验收：
+//   1. 饼图 8 格齐全、第 4/5/6 格的标签来自设置
+//   2. 第 8 格「说明」能打开说明面板
+//   3. 没填网址的那格点了会给提示气泡（而不是静默没反应）
+//   4. 设置面板里三行网址快捷键显示的是默认值
+//   5. 截一张图存下来，人眼再看一眼
+//
+// 用法：exe 带 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222 启动后
+//       node pet-ui-check.mjs
+import fs from 'node:fs'
+
+const PORT = Number(process.env.CDP_PORT || 9222)
+const SHOT = process.env.SHOT || 'E:\\1\\_diag\\pie-shot.png'
+
+async function findPage() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${PORT}/json`)
+      const list = await r.json()
+      const p = list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl)
+      if (p) return p
+    } catch { /* 还没起来 */ }
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  throw new Error(`连不上调试端口 ${PORT}`)
+}
+
+const page = await findPage()
+const ws = new WebSocket(page.webSocketDebuggerUrl)
+await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej })
+
+let seq = 0
+const pending = new Map()
+ws.onmessage = (e) => {
+  const m = JSON.parse(e.data)
+  if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id) }
+}
+function send(method, params) {
+  return new Promise((res) => {
+    const id = ++seq
+    pending.set(id, res)
+    ws.send(JSON.stringify({ id, method, params }))
+  })
+}
+async function evaluate(expression) {
+  const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true })
+  if (r.result?.exceptionDetails) throw new Error(JSON.stringify(r.result.exceptionDetails))
+  return r.result?.result?.value
+}
+const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+
+let fails = 0
+function check(name, ok, extra = '') {
+  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? '  ' + extra : ''}`)
+  if (!ok) fails++
+}
+
+// ── 1) 打开饼图（在画布上派发一次右键） ──
+await evaluate(`(() => {
+  const c = document.querySelector('canvas')
+  const r = c.getBoundingClientRect()
+  const ev = new MouseEvent('contextmenu', {
+    bubbles: true, cancelable: true,
+    clientX: r.width * 0.6, clientY: r.height * 0.4,
+  })
+  c.dispatchEvent(ev)
+  return true
+})()`)
+await wait(400)
+
+const pie = await evaluate(`(() => {
+  const paths = [...document.querySelectorAll('.pie-container svg path')]
+  const labels = [...document.querySelectorAll('.pie-container svg tspan[font-weight="600"]')]
+    .map((t) => t.textContent.trim())
+  const fills = paths.map((p) => p.getAttribute('fill'))
+  return { sectors: paths.length, labels, fills }
+})()`)
+check('饼图渲染出 8 格', pie?.sectors === 8, `实际 ${pie?.sectors}`)
+check('第 4/5/6 格标签 = 花园/网址/BGM',
+  pie?.labels?.[3] === '花园' && pie?.labels?.[4] === '网址' && pie?.labels?.[5] === 'BGM',
+  JSON.stringify(pie?.labels))
+check('没配网址的那格画得更暗（视觉上能看出"这里还没填"）',
+  pie?.fills?.[4] !== pie?.fills?.[3], `第4格=${pie?.fills?.[3]} 第5格=${pie?.fills?.[4]}`)
+check('原「漂浮」已不在饼图里', !pie?.labels?.includes('漂浮'))
+
+// ── 2) 点没配网址的那格：应当弹提示气泡 ──
+await evaluate(`(() => {
+  const paths = [...document.querySelectorAll('.pie-container svg path')]
+  paths[4].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  return true
+})()`)
+await wait(900)
+const bubble = await evaluate(`(() => {
+  const b = document.querySelector('.idle-bubble')
+  return b ? b.textContent.trim() : ''
+})()`)
+check('点空格子给了提示（不是静默没反应）', /网址|设置/.test(bubble), JSON.stringify(bubble?.slice(0, 60)))
+
+// ── 3) 再开一次饼图，点第 8 格「说明」 ──
+await evaluate(`(() => {
+  const c = document.querySelector('canvas')
+  const r = c.getBoundingClientRect()
+  c.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.width*0.6, clientY: r.height*0.4 }))
+  return true
+})()`)
+await wait(300)
+await evaluate(`(() => {
+  const paths = [...document.querySelectorAll('.pie-container svg path')]
+  paths[7].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  return true
+})()`)
+await wait(500)
+const help = await evaluate(`(() => {
+  const p = document.querySelector('.help-panel')
+  if (!p) return null
+  return {
+    title: p.querySelector('.chat-header span')?.textContent.trim(),
+    secs: [...p.querySelectorAll('.help-sec')].map((e) => e.textContent.trim()),
+    rows: p.querySelectorAll('.help-row').length,
+    scrollH: p.querySelector('.help-body').scrollHeight,
+    clientH: p.querySelector('.help-body').clientHeight,
+  }
+})()`)
+check('第 8 格能打开说明面板', !!help, help?.title || '')
+check('说明面板分了几段（操作/模式/手机/菜单/其他）', (help?.secs?.length || 0) >= 5, JSON.stringify(help?.secs))
+check('说明里提到网址快捷键可在设置里改', JSON.stringify(help?.secs || []).includes('环形菜单'))
+
+// 截图（说明面板开着）
+const shot = await send('Page.captureScreenshot', { format: 'png' })
+if (shot?.result?.data) {
+  fs.writeFileSync(SHOT, Buffer.from(shot.result.data, 'base64'))
+  console.log(`🖼  截图: ${SHOT}`)
+}
+
+// ── 4) 关掉说明，打开设置面板，看三行网址 ──
+await evaluate(`(() => {
+  const p = document.querySelector('.help-panel .chat-close')
+  if (p) p.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  return true
+})()`)
+await wait(300)
+await evaluate(`(() => {
+  const c = document.querySelector('canvas')
+  const r = c.getBoundingClientRect()
+  c.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.width*0.6, clientY: r.height*0.4 }))
+  return true
+})()`)
+await wait(300)
+await evaluate(`(() => {
+  const g = [...document.querySelectorAll('.pie-container svg g')].find((el) => el.querySelector('circle'))
+  g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  return true
+})()`)
+await wait(1200)
+const panel = await evaluate(`(() => {
+  const rows = [...document.querySelectorAll('.link-row')]
+  return {
+    count: rows.length,
+    values: rows.map((r) => {
+      const ins = r.querySelectorAll('input')
+      return [ins[0]?.value || '', ins[1]?.value || '']
+    }),
+    hasLabel: !!document.querySelector('.settings-panel .setting-label'),
+  }
+})()`)
+check('设置面板里有 3 行网址快捷键', panel?.count === 3, JSON.stringify(panel?.values))
+check('默认值 = 花园(dmhy) / 空 / BGM(bgm.tv)',
+  /dmhy\.org/.test(panel?.values?.[0]?.[1] || '') &&
+  (panel?.values?.[1]?.[1] || '') === '' &&
+  /bgm\.tv/.test(panel?.values?.[2]?.[1] || ''),
+  JSON.stringify(panel?.values))
+
+const shot2 = await send('Page.captureScreenshot', { format: 'png' })
+if (shot2?.result?.data) {
+  fs.writeFileSync(SHOT.replace('.png', '-settings.png'), Buffer.from(shot2.result.data, 'base64'))
+  console.log(`🖼  截图: ${SHOT.replace('.png', '-settings.png')}`)
+}
+
+console.log(fails === 0 ? '\n全部通过 ✅' : `\n有 ${fails} 项没通过 ❌`)
+ws.close()
+process.exit(fails === 0 ? 0 : 1)

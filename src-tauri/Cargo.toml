@@ -1,0 +1,85 @@
+[package]
+name = "desktop-pet"
+version = "1.0.2"
+description = "Desktop Pet - AI Desktop Companion"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "desktop_pet_lib"
+# 只保留 rlib。Tauri 模板默认还会产出 staticlib / cdylib（那是给 Android/iOS
+# 用的），但本项目移动端是独立的 Kotlin 工程 AIPhoneAgent，与 Tauri 移动端无关，
+# 且 src-tauri/gen/android 不存在。去掉后每次全量构建少产出约 1 GB 中间产物，
+# 桌面端功能完全不变（main.rs 链接的就是这个 rlib）。
+# 若将来真要用 tauri android/ios，改回 ["staticlib", "cdylib", "rlib"] 即可。
+crate-type = ["lib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 刻意不开 multipart 特性：它要拉 mime_guess 这个额外依赖。
+# telegram.rs 的文件上传是手工拼 multipart/form-data 的（见 multipart_body），
+# 零依赖且能被单测完整验证。
+reqwest = { version = "0.12", features = ["json"] }
+# rt-multi-thread：tokio::runtime::Runtime::new() 需要。
+# time：telegram.rs 的长轮询重试用 tokio::time::sleep（reqwest 也会间接启用它，
+# 但显式声明才不会因为依赖树变化而突然编译不过）。
+# 原来的 "full" 会额外拉进 fs/process/signal/net/io-util/macros/sync 等一整套 crate。
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+base64 = "0.22"
+ring = "0.17"
+flate2 = "1"
+rodio = "0.20"
+minimp3 = "0.5"
+imap = "2"
+native-tls = "0.2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[target.'cfg(windows)'.dependencies]
+# Win32_System_Diagnostics_Debug 只为了 SetErrorMode：关掉系统级的硬错误**模态框**。
+# 不关的话 spawn 一个非法 exe 会弹模态框并卡住调用线程（更新界面会永远停在"正在安装"）。
+windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Diagnostics_Debug"] }
+
+# ─────────────────── 构建产物瘦身 ───────────────────
+# 背景：Tauri + 551 个依赖，默认配置会在 target/ 下堆积约 17 GB 中间产物
+# （其中 debug/incremental 一项就 6.5 GB）。以下配置不改变任何功能，
+# 只削减调试符号、增量会话和冗余产物。
+
+[profile.dev]
+# 默认 2（full），会生成 GB 级 .pdb 和膨胀的 .o/.lib。
+# 1 = 仅行号表：仍有带行号的 panic 回溯，只是没有局部变量/类型细节。
+# 实测可把符号相关体积压下约 90%。
+debug = 1
+# 关闭增量编译。incremental 的会话目录（s-<hash>）只增不删，
+# 反复重编译会线性堆积，是缓存膨胀的最大单一来源。
+# 代价：改代码后重编译变慢。需要快速迭代时可临时改回 true，
+# 或用 scripts/clean.ps1 -IncrementalOnly 定期清理。
+incremental = false
+
+[profile.dev.build-override]
+# build script 只负责生成代码，不需要任何调试符号。
+debug = false
+
+[profile.release]
+# 去掉符号表：可执行文件从约 61 MB 降到十几 MB，不影响运行。
+strip = true
+# 跨 crate 内联优化，显著减小体积（"thin" 是体积与编译时间的折中）。
+lto = "thin"
+# 单 codegen unit：产物更小、运行更快，代价是编译更慢。
+codegen-units = 1
+# 以体积为优先的优化级别。
+opt-level = "s"
+# 注意：这里刻意没有用 panic = "abort"。
+# db.rs / lib.rs 里有大量 `state.db.lock().unwrap()`，panic 是可能发生的；
+# unwind 下线程级 panic 不会拖垮整个应用，abort 会让桌宠直接退出。
+# 这是一个真实的行为差异，为省几 MB 不值得。若你确认不需要该韧性，
+# 可自行加 panic = "abort"（约再省 10%）。
+
+[profile.release.build-override]
+debug = false
+incremental = false
