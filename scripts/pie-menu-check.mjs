@@ -160,15 +160,21 @@ const panel = await evaluate(`(() => {
       const ins = r.querySelectorAll('input')
       return [ins[0]?.value || '', ins[1]?.value || '']
     }),
+    inputsPerRow: rows.map((r) => r.querySelectorAll('input').length),
     hasLabel: !!document.querySelector('.settings-panel .setting-label'),
   }
 })()`)
 check('设置面板里有 3 行网址快捷键', panel?.count === 3, JSON.stringify(panel?.values))
-check('默认值 = 花园(dmhy) / 空 / BGM(bgm.tv)',
-  /dmhy\.org/.test(panel?.values?.[0]?.[1] || '') &&
-  (panel?.values?.[1]?.[1] || '') === '' &&
-  /bgm\.tv/.test(panel?.values?.[2]?.[1] || ''),
-  JSON.stringify(panel?.values))
+// 这里**不再断言"默认值是哪几个网址"**：
+//   ① 面板显示的是**磁盘上存着的值**，而这条脚本跑的是主人真实的 settings.json ——
+//      他要是自己填过网址，断言"默认值"必然误报；
+//   ② 原来那条断言写的是 `dmhy.org` / `bgm.tv`，那是作者早期的私人主页默认值
+//      （早已改成默认全空），留着它等于把私人站点又抄回仓库（安全审查 S11）。
+// "默认三格必须是空的"这句话改在源码层面断言 —— 见 scripts/regression-check.mjs。
+// 这里只验结构：每行都得有一个名称框和一个网址框，否则面板就是坏的。
+check('每行都有一个名称框和一个网址框',
+  Array.isArray(panel?.inputsPerRow) && panel.inputsPerRow.length > 0 && panel.inputsPerRow.every((n) => n === 2),
+  JSON.stringify(panel?.inputsPerRow))
 
 const shot2 = await send('Page.captureScreenshot', { format: 'png' })
 if (shot2?.result?.data) {

@@ -212,6 +212,51 @@ const FORBIDDEN = [
     re: /wait_with_output/,
     why: 'run_command 要用两个线程并发读 stdout/stderr（4KB 管道会写满堵死），不要退回单线程等待',
   },
+  // ─── S11：个人的东西不许再进仓库 ───
+  // （README 清过一次；这几条盯的是**脚本与源码**里的同类残留）
+  {
+    id: 'S11',
+    file: 'settings.rs',
+    re: /LINK_DEFAULTS[^;]*http/,
+    why: '环形菜单三格网址的**默认值必须全空**：预置作者的个人主页 = 每装一份就把他的私人页面带出去一份',
+  },
+  {
+    id: 'S11',
+    file: 'settings.rs',
+    re: /LINK_DEFAULTS.*(dmhy|bgm\.tv|userdetails)/,
+    why: '同上另一半：默认值里不许出现作者的个人主页站点（dmhy / bgm.tv / userdetails.php）',
+  },
+  {
+    id: 'S11',
+    file: 'make-update-manifest.mjs',
+    re: /E:[\\/]{1,2}1[\\/]{1,2}_keys/,
+    why: '签名私钥的路径是发布者机器上的私人路径：必须由参数 / PET_UPDATE_KEY 显式给，不能写死在源码里',
+  },
+  {
+    id: 'S11',
+    file: 'update-e2e.mjs',
+    re: /E:[\\/]{1,2}1[\\/]{1,2}_keys/,
+    why: '同上：验收脚本不内置发布者的私钥路径（没设 PET_UPDATE_KEY 就跳过，而不是去猜一个路径）',
+  },
+  {
+    id: 'S11',
+    file: 'publish.mjs',
+    re: /E:[\\/]{1,2}1[\\/]{1,2}_keys/,
+    why: '同上：发布脚本里也不许出现私钥的本机路径',
+  },
+  {
+    id: 'S11',
+    file: 'update.rs',
+    re: /E:[\\/]{1,2}1[\\/]{1,2}_keys/,
+    includeComments: true,
+    why: '同上：连注释里都不写发布者的私钥路径（README 已经为这一条清过一次）',
+  },
+  {
+    id: 'S11',
+    file: 'pie-menu-check.mjs',
+    re: /dmhy|bgm\.tv|userdetails/,
+    why: '验收脚本不该再断言/记录作者的私人主页；"默认三格为空"改在源码层面断言（见上面 LINK_DEFAULTS 两条）',
+  },
 ]
 
 /** 需要读的文件（相对仓库根） */
@@ -225,6 +270,11 @@ const FILES = {
   'update.rs': join(SRC, 'update.rs'),
   'project.rs': join(SRC, 'project.rs'),
   'App.vue': join(ROOT, 'src', 'App.vue'),
+  // 发布/验收脚本也在扫描范围内：私钥路径、个人主页这类"作者环境信息"最容易藏在脚本里
+  'make-update-manifest.mjs': join(ROOT, 'scripts', 'make-update-manifest.mjs'),
+  'update-e2e.mjs': join(ROOT, 'scripts', 'update-e2e.mjs'),
+  'publish.mjs': join(ROOT, 'scripts', 'publish.mjs'),
+  'pie-menu-check.mjs': join(ROOT, 'scripts', 'pie-menu-check.mjs'),
 }
 
 /** 命中行出现在注释里时放行（注释里引用"旧写法"是好事，不是回归） */
@@ -253,7 +303,10 @@ for (const rule of FORBIDDEN) {
   for (let i = 0; i < lines.length; i++) {
     // 整文件范围的正则（比如"必须存在"的正向规则）单独处理
     if (rule.re.source.includes('[\\s\\S]')) continue
-    if (rule.re.test(lines[i]) && !isCommentLine(lines[i])) {
+    // 注释里引用"旧写法"是好事（说明来龙去脉），默认不算命中；
+    // 但有些规则连注释都不许出现（比如发布者的私钥路径），用 includeComments 打开
+    if (!rule.includeComments && isCommentLine(lines[i])) continue
+    if (rule.re.test(lines[i])) {
       hits.push({ n: i + 1, line: lines[i].trim().slice(0, 100) })
     }
   }

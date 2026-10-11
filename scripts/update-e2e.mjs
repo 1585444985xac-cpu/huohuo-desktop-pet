@@ -6,8 +6,10 @@
 //   C 哈希不对      → 检查能过（签名是真的），下载后被 sha256 拦下（"对不上"）
 //   D 界面          → 弹窗内容、稍后/跳过、以及"立即更新"的下载与失败提示
 //
-// 需要配套私钥（发布者机器上才有）：默认 E:\1\_keys\update_ed25519_private.pem
-// 用法：先带调试端口启动桌宠，然后 node scripts/update-e2e.mjs
+// 需要一份发布侧私钥来签测试清单：从环境变量 PET_UPDATE_KEY 取。
+// **源码里刻意不留默认路径**（安全审查 S11）：那是发布者机器上的私人路径，
+// 写进仓库等于每克隆一份就抄走一份。
+// 用法：$env:PET_UPDATE_KEY='<私钥.pem>'; node scripts/update-e2e.mjs
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
@@ -15,9 +17,13 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 
 const PORT = Number(process.env.CDP_PORT || 9222)
-const KEY = process.env.PET_UPDATE_KEY || 'E:\\1\\_keys\\update_ed25519_private.pem'
+const KEY = process.env.PET_UPDATE_KEY
 const MANIFEST_FORMAT = 1
 
+if (!KEY) {
+  console.log('跳过：没设 PET_UPDATE_KEY（端到端验证需要一份私钥来签测试清单；源码里刻意不留默认路径）')
+  process.exit(0)
+}
 if (!fs.existsSync(KEY)) {
   console.log(`跳过：没有私钥 ${KEY}（端到端验证需要它来签测试清单）`)
   process.exit(0)

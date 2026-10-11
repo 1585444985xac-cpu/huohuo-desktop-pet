@@ -5,7 +5,7 @@
 //
 // 干三件事：
 //   1. 算出安装包的 SHA-256、大小
-//   2. 用私钥（默认 E:\1\_keys\update_ed25519_private.pem）对规范串签名
+//   2. 用私钥对规范串签名（私钥路径**必须显式给**，见下）
 //   3. 写出 latest.json（与安装包同目录），连同安装包一起上传即可
 //
 // 规范串必须和 src-tauri/src/update.rs 的 canonical() 完全一致 ——
@@ -18,7 +18,7 @@ const MANIFEST_FORMAT = 1
 const [, , installerArg, notesArg, keyArg] = process.argv
 
 if (!installerArg) {
-  console.error('用法: node scripts/make-update-manifest.mjs <安装包路径> "<版本说明>" [私钥路径]')
+  console.error('用法: node scripts/make-update-manifest.mjs <安装包路径> "<版本说明>" <私钥路径>')
   process.exit(1)
 }
 const installer = path.resolve(installerArg)
@@ -26,7 +26,20 @@ if (!fs.existsSync(installer)) {
   console.error(`找不到安装包: ${installer}`)
   process.exit(1)
 }
-const keyPath = keyArg || 'E:\\1\\_keys\\update_ed25519_private.pem'
+
+// 私钥路径**刻意不写死在源码里**（安全审查 S11）：它是发布者机器上的私人路径，
+// 写进仓库等于每克隆一份就抄走一份 —— 而 README 里本来就已经把它清掉了。
+// 现在必须显式给：命令行第 3 个参数，或者环境变量 PET_UPDATE_KEY。
+const keyPath = keyArg || process.env.PET_UPDATE_KEY
+if (!keyPath) {
+  console.error(
+    '没给私钥路径。\n' +
+      '源码里刻意不留默认值（那是发布者机器上的私人路径，不该进仓库），请显式指定：\n' +
+      '  node scripts/make-update-manifest.mjs <安装包路径> "<版本说明>" <私钥.pem>\n' +
+      '  或者先设环境变量 PET_UPDATE_KEY 再跑（少了这个参数就是这个报错，不会去猜一个路径）'
+  )
+  process.exit(1)
+}
 if (!fs.existsSync(keyPath)) {
   console.error(`找不到私钥: ${keyPath}\n（私钥不进仓库；丢了就只能换密钥并重新发一版程序）`)
   process.exit(1)
