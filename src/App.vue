@@ -4045,9 +4045,12 @@ onUnmounted(async () => {
             >
               {{ settings.autostart_watchdog ? '已开启' : '已关闭' }}
             </button>
-            <span class="setting-switch-label">看门狗（关掉桌宠后也能用手机叫回来）</span>
+            <span class="setting-switch-label">看门狗（默认关；开了才能用手机把桌宠叫回来）</span>
           </div>
-          <div class="setting-hint">状态直接读启动文件夹里的快捷方式，你手工删掉也会如实显示</div>
+          <div class="setting-hint">
+            看门狗默认是关的。打开后它随桌宠一起起来，并在桌宠关掉后接着守着手机那条通道
+            （发「启动」就能把她叫回来）。状态直接读启动文件夹里的快捷方式，你手工删掉也会如实显示。
+          </div>
         </div>
 
         <!-- 环形菜单的三格网址快捷键 -->

@@ -2771,6 +2771,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// **新用户默认不开看门狗**（主人明确要求的行为）。
+    ///
+    /// 这条规则的事实来源是"启动文件夹里有没有那个快捷方式"：
+    /// 全新安装的机器上什么都没有 → `is_autostart_enabled("watchdog")` 必须是 false
+    /// → `lib.rs::ensure_watchdog_running()` 直接返回，不会替新用户起那个常驻进程。
+    ///
+    /// 也顺带钉住"关掉之后立刻算关"：主人关掉开关，看门狗自己会看到它变 false 然后退出
+    /// （见 watch.rs 的主循环），所以这里判错的后果是"关了也退不掉"。
+    #[test]
+    fn watchdog_autostart_defaults_to_off_and_follows_the_shortcut() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-autostart-default");
+        let startup = base.join("Startup");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&startup).unwrap();
+        let fake_exe = base.join("desktop-pet.exe");
+        std::fs::write(&fake_exe, b"stub").unwrap();
+
+        let lnk = startup.join("huohuo-watchdog.lnk");
+
+        // ① 全新安装：启动目录是空的 → 必须是"关"
+        assert!(
+            !lnk.exists(),
+            "前提：这里模拟的是刚装好、还没碰过开关的机器"
+        );
+        assert!(
+            !autostart_path_in(&startup, "watchdog").unwrap().exists(),
+            "新用户默认必须是「看门狗关」——否则新装好就会多一个常驻进程"
+        );
+
+        // ② 主人打开开关 → 立刻算"开"（看门狗该起来了）
+        set_autostart_in(&startup, &fake_exe, "watchdog", true).unwrap();
+        assert!(
+            autostart_path_in(&startup, "watchdog").unwrap().exists(),
+            "打开后应当算「开」"
+        );
+
+        // ③ 主人关掉 → 立刻算"关"（看门狗下一轮就会自己退出）
+        set_autostart_in(&startup, &fake_exe, "watchdog", false).unwrap();
+        assert!(
+            !autostart_path_in(&startup, "watchdog").unwrap().exists(),
+            "关掉之后必须立刻算「关」，否则看门狗退不掉"
+        );
+
+        // ④ 桌宠那一项与看门狗互不影响（关看门狗不该顺手关掉桌宠自启）
+        set_autostart_in(&startup, &fake_exe, "pet", true).unwrap();
+        assert!(startup.join("huohuo-pet.lnk").exists());
+        assert!(
+            !autostart_path_in(&startup, "watchdog").unwrap().exists(),
+            "开桌宠自启**不能**顺带把看门狗也打开（那正是这次要改掉的行为）"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // ─── 🤖 模型 API（多服务商） ───
 
     /// 预设表本身的完整性。这张表是"哪些服务商能用"的唯一事实来源，

@@ -4840,23 +4840,45 @@ fn set_volc_enabled(enabled: bool) -> Result<(), String> {
     settings::set_volc_enabled(enabled)
 }
 
-/// 开关开机自启，返回操作后的真实状态（失败时带原因）
+/// 开关开机自启，返回操作后的真实状态（失败时带原因）。
+///
+/// 「看门狗」这一项同时是**看门狗的总开关**（见 `ensure_watchdog_running` 的说明）：
+/// 打开时立刻把它叫起来，不然主人会以为开关坏了、要重启桌宠才生效。
+/// 关掉时不在这里杀它 —— 看门狗自己会看到开关关了然后退出。
 #[tauri::command]
 fn set_autostart(kind: String, enabled: bool) -> Result<bool, String> {
-    settings::set_autostart(&kind, enabled)
+    let actual = settings::set_autostart(&kind, enabled)?;
+    if kind == "watchdog" && actual {
+        ensure_watchdog_running();
+    }
+    Ok(actual)
 }
 
 // ─── App Entry ───
 
-/// 确保看门狗在跑：没在跑就顺手起一个（detached，不占桌宠的窗口）。
+/// 确保看门狗在跑：**开关开着**且没在跑，才顺手起一个（detached，不占桌宠的窗口）。
 ///
-/// 这样桌面上只需要**一个**快捷方式：双击它起桌宠，桌宠再把看门狗带起来。
-/// 看门狗要负责"桌宠关掉之后还能用手机把它叫回来"，所以它必须比桌宠活得久 ——
-/// 不能由桌宠自己兼任（桌宠一关，那个能力就没了）。
+/// # 新用户默认是关的
+///
+/// 看门狗是一个常驻进程 + 一条到 Telegram 的长连接 —— 它属于"远程能碰到这台电脑"
+/// 的能力（手机发一句话就能把桌宠叫起来，进而用文件工具）。按本项目的规矩，
+/// 这类能力默认必须是**关**的，由主人自己在设置里打开；
+/// 原来"桌宠一起来就把看门狗带起来"等于替新用户默认打开了它。
+///
+/// 判断依据直接用启动文件夹里那个快捷方式在不在（`is_autostart_enabled("watchdog")`）——
+/// 它和面板上的开关是**同一个事实来源**，所以不会出现"设置说开着、实际没开"的两套账，
+/// 也不需要新增设置字段。
+///
+/// 打开开关时由 [`set_autostart`] 立刻调用这里，所以不用重启桌宠就生效；
+/// 关掉开关时**不在这里杀它** —— 看门狗自己会看到开关关了然后退出（见 watch.rs），
+/// 那样更干净：两者是同一个 exe，按进程名杀会连桌宠本体一起杀掉。
 ///
 /// 注意这里**不是**每只桌宠都会起看门狗：先探测看门狗锁，
 /// 已经有一个在跑就什么都不做，避免重复起一个立刻退出的僵尸进程。
 fn ensure_watchdog_running() {
+    if !settings::is_autostart_enabled("watchdog") {
+        return;
+    }
     if instance::watchdog_is_running() {
         return;
     }

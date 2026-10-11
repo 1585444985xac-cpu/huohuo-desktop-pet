@@ -279,6 +279,21 @@ const FORBIDDEN = [
     negate: true,
     why: '（正向）落点判定（是不是宠物身上）要单独一个函数：拖到面板/设置输入框上必须不算',
   },
+  // ─── 看门狗默认关（新用户装完不该多一个常驻进程）───
+  {
+    id: '看门狗默认关',
+    file: 'lib.rs',
+    re: /is_autostart_enabled\("watchdog"\)/,
+    negate: true,
+    why: '（正向）ensure_watchdog_running 必须先看「看门狗」开关：新用户默认关，不能替他把这个常驻进程起起来',
+  },
+  {
+    id: '看门狗默认关',
+    file: 'watch.rs',
+    re: /is_autostart_enabled\("watchdog"\)/,
+    negate: true,
+    why: '（正向）看门狗主循环里要自己看开关并退出 —— 两者是同一个 exe，不能靠按名字杀进程来关它',
+  },
 ]
 
 /** 需要读的文件（相对仓库根） */
