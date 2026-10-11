@@ -1235,7 +1235,14 @@ async function togglePetVisible() {
   } catch { /* 窗口 API 异常就算了，别影响别的动作 */ }
 }
 
-// ─── 拖放：桌面快捷方式 → 「程序位置」输入框 ───
+// ─── 拖放：桌面快捷方式 → 「程序位置」输入框；文件 → 丢给桌宠 ───
+
+/** 已打开的面板 / 气泡：拖放落在它们上面时，不算"丢给桌宠" */
+const PANEL_SELECTORS =
+  '.chat-panel, .settings-panel, .memory-panel, .help-panel, .update-panel, .tool-confirm-panel, .info-popup, .email-bubble, .pie-container'
+
+/** 正拖着东西悬在宠物身上（用来显示"松手就交给我"的提示） */
+const dropHover = ref(false)
 
 /**
  * 松手那一刻指针底下是哪个拖放目标（输入框上的 `data-drop-target`）。
@@ -1251,16 +1258,36 @@ function dropTargetAt(pos?: { x: number; y: number }): string {
 }
 
 /**
- * 把拖进来的文件填进对应的输入框。
+ * 这个位置算不算"宠物身上"。
+ *
+ * 三种情况都要排除：拖到设置里的拖放输入框（那是另一种行为）、
+ * 拖到任何已打开的面板/气泡上（手一滑不该触发别的功能）、指针已经不在窗口里。
+ */
+function isOverPet(pos?: { x: number; y: number }): boolean {
+  if (!pos) return false
+  const dpr = window.devicePixelRatio || 1
+  const el = document.elementFromPoint(pos.x / dpr, pos.y / dpr) as HTMLElement | null
+  if (!el) return false
+  if (el.closest('[data-drop-target]')) return false
+  return !el.closest(PANEL_SELECTORS)
+}
+
+/**
+ * 拖放的**分流**：落在设置里的拖放输入框上 → 填那个框；落在宠物身上 → 交给她。
  *
  * `.lnk` 先交给后端解析成真实路径 —— 用户手里现成的就是桌面上那个图标，
- * 让他自己去翻安装目录是强人所难。丢在别处（不在输入框上）就什么都不做，
+ * 让他自己去翻安装目录是强人所难。落在面板上（既不是输入框、也不是宠物）就什么都不做，
  * 免得手一滑就把设置改了。
  */
 async function handleFileDrop(paths: string[], pos?: { x: number; y: number }) {
   const key = dropTargetAt(pos)
   const file = (paths || [])[0]
-  if (!key || !file) return
+  if (!key) {
+    // 不在设置输入框上 → 当成"丢给桌宠"（拖到面板上则什么也不做）
+    if (isOverPet(pos)) await handlePetDrop(paths)
+    return
+  }
+  if (!file) return
   try {
     const real = await invoke<string>('resolve_shortcut', { path: file })
     ;(settings.value as Record<string, any>)[key] = real
@@ -1272,6 +1299,64 @@ async function handleFileDrop(paths: string[], pos?: { x: number; y: number }) {
   } catch (e) {
     settingsMsg.value = `❌ ${String(e).slice(0, 120)}`
   }
+}
+
+/**
+ * 把拖到宠物身上的东西交给藿藿。
+ *
+ * 交互选的是"**切到文件模式 + 把路径填进输入框**"，而不是直接发一条请求：
+ * 主人拖进文件通常紧接着要说"整理成要点"这类话，直接发会先花掉一次调用，
+ * 而他可能只是想让路径出现在输入框里。回车即发，不想用就删掉。
+ *
+ * 为什么"这是文件还是文件夹 / 是不是禁区"要问后端：前端没有文件系统权限，
+ * 而且禁区判定必须在后端（详见 lib.rs::inspect_dropped_paths）。
+ */
+async function handlePetDrop(paths: string[]) {
+  const list = (paths || []).filter((p) => p && p.trim())
+  if (!list.length) return
+
+  type Info = { path: string; name: string; kind: string; size: number; note: string }
+  let info: Info[] = []
+  try {
+    info = await invoke<Info[]>('inspect_dropped_paths', { paths: list })
+  } catch (e) {
+    chatReply.value = `❌ 认不出拖进来的东西：${String(e).slice(0, 120)}`
+    return
+  }
+  if (!info.length) return
+
+  const ok = info.filter((i) => i.kind === 'file' || i.kind === 'dir')
+  const bad = info.filter((i) => i.kind !== 'file' && i.kind !== 'dir')
+
+  showChat.value = true
+  setChatMode('file')
+
+  if (!ok.length) {
+    // 全是禁区 / 找不到：**如实拒绝**，不把路径填进去。
+    // 填进去等于让模型拿着一个禁区路径反复试，把轮次耗光还查不出原因。
+    chatReply.value = bad.map((b) => `${b.name}：${b.note}`).join('\n')
+    return
+  }
+
+  await nextTick()
+  const lead =
+    ok.length > 1 ? '请看看这些文件：' : ok[0].kind === 'dir' ? '请看看这个文件夹：' : '请看看这个文件：'
+  chatInput.value = `${lead}${ok.map((i) => i.path).join('、')} `
+  autoGrowInput()
+  chatInputRef.value?.focus()
+  // 面板刚打开时区域可能还没算进来（区域是每 3 帧重算一次），主动推一次，
+  // 免得主人发现输入框在窗口里但点不动
+  updateWindowRegion()
+
+  const tips = bad.map((b) => `没接「${b.name}」：${b.note}`)
+  // 后端一次最多认 20 个：真被截断了要**说出来**，不做静默截断。
+  // （`list` 已经滤掉空串，所以"少了"就只可能是超过上限）
+  if (list.length > info.length) {
+    tips.push(`一次最多认 ${info.length} 个，后面 ${list.length - info.length} 个没接。`)
+  }
+  chatReply.value = tips.length
+    ? tips.join('\n')
+    : `已收到 ${ok.length} 个${ok[0].kind === 'dir' ? '文件夹' : '文件'}，想让藿藿做什么？（直接回车就先看看它）`
 }
 
 /** 邮箱「测试连接」。
@@ -3079,7 +3164,18 @@ onMounted(async () => {
   try {
     unlistenDrop = await getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload as any
+      // 拖动过程中给一个"松手就交给我"的提示：不然主人不知道这里能不能放。
+      // 只有悬在宠物身上时才提示 —— 悬在面板上不该有任何反应。
+      if (p?.type === 'enter' || p?.type === 'over') {
+        dropHover.value = isOverPet(p.position)
+        return
+      }
+      if (p?.type === 'leave') {
+        dropHover.value = false
+        return
+      }
       if (p?.type !== 'drop') return
+      dropHover.value = false
       handleFileDrop(p.paths || [], p.position)
     })
   } catch { /* 拿不到监听也不影响手填 */ }
@@ -3125,6 +3221,11 @@ onUnmounted(async () => {
     <canvas ref="canvasRef"></canvas>
 
     <div v-if="showIdleBubble" class="idle-bubble" :style="idleBubbleStyle">{{ idleBubble }}</div>
+
+    <!-- 拖文件悬在宠物身上时的提示。
+         `pointer-events: none` 是必须的：它不能成为 elementFromPoint 的结果，
+         否则"拖到哪里算宠物身上"会被这个提示自己挡住而判错。 -->
+    <div v-if="dropHover" class="drop-hint">📄 松手就把文件交给藿藿</div>
 
     <div v-if="showEmailBubble" class="email-bubble" :style="emailBubbleStyle" @dblclick="showNextEmail()">
       {{ emailBubble }}
@@ -4312,6 +4413,13 @@ canvas { display: block; width: 100%; height: 100%; pointer-events: auto; }
   position: absolute; top: 6px; right: 44px;
   font-size: 11px; color: #6d4c41; background: rgba(255,255,255,0.85);
   border-radius: 6px; padding: 2px 6px; pointer-events: none;
+}
+/* 拖文件悬停提示：只在宠物身上出现，别挡鼠标（见模板里的说明） */
+.drop-hint {
+  position: absolute; left: 50%; top: 10px; transform: translateX(-50%);
+  background: rgba(255,248,225,0.95); border: 2px dashed #f9a825; border-radius: 14px;
+  padding: 6px 12px; font-size: 12px; font-weight: 600; color: #5d4037;
+  z-index: 100002; pointer-events: none; white-space: nowrap;
 }
 .email-bubble::after {
   content: ''; position: absolute; bottom: -10px; left: 50%; transform: translateX(-50%);

@@ -257,6 +257,28 @@ const FORBIDDEN = [
     re: /dmhy|bgm\.tv|userdetails/,
     why: '验收脚本不该再断言/记录作者的私人主页；"默认三格为空"改在源码层面断言（见上面 LINK_DEFAULTS 两条）',
   },
+  // ─── 拖文件给桌宠（把落点识别与禁区判定留在后端）───
+  {
+    id: '拖文件',
+    file: 'App.vue',
+    re: /inspect_dropped_paths/,
+    negate: true,
+    why: '（正向）拖到宠物身上的路径必须过后端 inspect_dropped_paths：前端没有文件系统权限，禁区判定也不能放在前端（那边可以被绕过）',
+  },
+  {
+    id: '拖文件',
+    file: 'App.vue',
+    re: /function handlePetDrop/,
+    negate: true,
+    why: '（正向）"丢给桌宠"要有独立入口，别和设置面板的拖放输入框混在一个分支里',
+  },
+  {
+    id: '拖文件',
+    file: 'App.vue',
+    re: /function isOverPet/,
+    negate: true,
+    why: '（正向）落点判定（是不是宠物身上）要单独一个函数：拖到面板/设置输入框上必须不算',
+  },
 ]
 
 /** 需要读的文件（相对仓库根） */

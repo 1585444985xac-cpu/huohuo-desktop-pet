@@ -312,6 +312,96 @@ fn resolve_shortcut(path: String) -> Result<String, String> {
     Ok(target)
 }
 
+// ─── 拖到桌宠身上的文件 ───
+
+/// 一次拖放最多认几个路径。
+///
+/// 拖一个文件夹进来可能带出几百个路径，全塞进聊天框既没法看、也会把上下文挤爆。
+/// 20 个够用；超出的部分前端会如实说"只接了前 20 个"（不做静默截断）。
+const MAX_DROPPED_PATHS: usize = 20;
+
+/// 拖进来的一个路径，"这是什么"。
+#[derive(Serialize)]
+struct DroppedPath {
+    /// 展示用的路径（去掉 Windows canonicalize 的 `\\?\` 前缀；`.lnk` 已解析成目标）
+    path: String,
+    name: String,
+    /// file / dir / protected / missing
+    kind: String,
+    size: u64,
+    /// 给主人看的一句话（禁区为什么拒、找不到是怎么回事）；正常文件为空
+    note: String,
+}
+
+/// 路径分类：**禁区优先于一切**。
+///
+/// 抽成纯函数是为了能单测（这条是安全边界，不能靠"读代码推理说应该没问题"）：
+/// 分类顺序错了就会出现"settings.json 被当成普通文件交给她"这种事。
+fn classify_dropped(path: &std::path::Path) -> (&'static str, u64) {
+    if agent_guard::is_protected_path(path) {
+        return ("protected", 0);
+    }
+    if path.is_dir() {
+        return ("dir", 0);
+    }
+    if path.is_file() {
+        // 拿不到大小不影响用，给 0 就行（前端只是显示一下）
+        return ("file", std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+    }
+    ("missing", 0)
+}
+
+/// 把拖到桌宠身上的东西认一遍，交给前端去填聊天框。
+///
+/// # 为什么要有这个后端命令（前端明明拿得到路径字符串）
+///
+/// 1. **前端没有文件系统权限**（Tauri 只开了三项基础权限）：连"这是文件还是文件夹"
+///    都判断不了，更别说大小；
+/// 2. **权限判定必须在后端**：`agent_guard::is_protected_path` 是安全边界，
+///    前端自己写一份判断迟早会漏，而且前端那侧的判断改不了这一侧的结论；
+/// 3. **`.lnk` 要解析**：用户手头现成的就是桌面那个图标，
+///    拖进来的很可能是快捷方式而不是真文件（复用设置里那套 `resolve_shortcut`）。
+///
+/// 拖进来的路径**不经过 `resolve_path`**：它是系统给的绝对路径，
+/// 不该再被"相对路径补到桌面"那套逻辑处理一遍。
+#[tauri::command]
+fn inspect_dropped_paths(paths: Vec<String>) -> Vec<DroppedPath> {
+    paths
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .take(MAX_DROPPED_PATHS)
+        .map(|raw| {
+            let raw = raw.trim().to_string();
+            // `.lnk` 解析失败就用原路径 —— 后面会判成 missing，并告诉她"目标不在原处了"
+            let resolved = if raw.to_lowercase().ends_with(".lnk") {
+                resolve_shortcut(raw.clone()).unwrap_or(raw.clone())
+            } else {
+                raw.clone()
+            };
+            let p = std::path::PathBuf::from(&resolved);
+            let (kind, size) = classify_dropped(&p);
+            let note = match kind {
+                "protected" => agent_guard::protected_path_message(&p),
+                "missing" => format!(
+                    "找不到这个文件（{}）。如果拖的是快捷方式，多半是它的目标已经不在原处了。",
+                    show_path(&p)
+                ),
+                _ => String::new(),
+            };
+            DroppedPath {
+                name: p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| show_path(&p)),
+                path: show_path(&p),
+                kind: kind.to_string(),
+                size,
+                note,
+            }
+        })
+        .collect()
+}
+
 // ─── 收件邮箱检查 ───
 //
 // 邮箱地址、IMAP 授权码、IMAP 服务器**全部来自设置**（settings.rs），源码里不留 ——
@@ -4846,6 +4936,7 @@ pub fn run() {
             open_link_slot,
             link_shortcuts,
             resolve_shortcut,
+            inspect_dropped_paths,
             update_status,
             update_check,
             update_download,
@@ -6357,7 +6448,6 @@ mod tests {
     }
 
     // ─── 安全审查 S9 / B31 / B33：web_fetch ───
-
     /// S9：SSRF 防护的两层判断。
     ///
     /// 这份名单是"这道防线到底挡得住什么"的说明书：
@@ -6567,5 +6657,75 @@ mod tests {
         // 单段相对路径仍然落在工作目录（桌面），别被这条规则抢走
         let plain = resolve_path("__huohuo_不存在的测试文件__.txt");
         assert_eq!(plain.parent(), Some(work_dir().as_path()));
+    }
+
+    /// 拖到桌宠身上的路径分类：**禁区优先于一切**。
+    ///
+    /// 这条是安全边界：如果分类顺序写反了（先判 is_file），
+    /// 一份 `settings.json` 就会被当成普通文件塞进聊天框交给模型 ——
+    /// 那是第 19 节里最想挡住的场景。
+    #[test]
+    fn dropped_paths_are_classified_with_protected_first() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-drop");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // ① 普通文件：能拿到大小
+        let f = base.join("笔记.txt");
+        std::fs::write(&f, "你好，藿藿").unwrap();
+        assert_eq!(classify_dropped(&f).0, "file");
+        assert!(classify_dropped(&f).1 > 0, "文件大小应当能读出来");
+
+        // ② 文件夹：也能拖（"看看这个文件夹里有什么"）
+        let d = base.join("一个文件夹");
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(classify_dropped(&d).0, "dir");
+
+        // ③ 禁区：**真的建一个叫 settings.json 的文件**再判 ——
+        //    光测"名字匹配"不够，要证明顺序上它没被 is_file 抢走
+        let secret = base.join("settings.json");
+        std::fs::write(&secret, r#"{"llm_api_key":"假值"}"#).unwrap();
+        assert!(secret.is_file(), "前提：它确实是个存在的普通文件");
+        assert_eq!(
+            classify_dropped(&secret).0,
+            "protected",
+            "禁区必须优先于 is_file，否则密钥会被当成普通文件交给模型"
+        );
+        // 私钥同理
+        let pem = base.join("server.pem");
+        std::fs::write(&pem, "假值").unwrap();
+        assert_eq!(classify_dropped(&pem).0, "protected");
+
+        // ④ 不存在的路径：如实说 missing（多半是快捷方式的目标没了）
+        let gone = base.join("早就删了.txt");
+        assert_eq!(classify_dropped(&gone).0, "missing");
+
+        // ⑤ 命令层：空路径被丢掉，且给禁区附了一句"为什么拒"的说明
+        let out = inspect_dropped_paths(vec![
+            "   ".to_string(),
+            secret.display().to_string(),
+            gone.display().to_string(),
+            f.display().to_string(),
+        ]);
+        assert_eq!(out.len(), 3, "空白路径应当被丢掉，实际 {}", out.len());
+        assert_eq!(out[0].kind, "protected");
+        assert!(
+            out[0].note.contains("安全拒绝"),
+            "禁区要给出理由，不能只回一个 kind：{}",
+            out[0].note
+        );
+        assert_eq!(out[1].kind, "missing");
+        assert!(!out[1].note.is_empty(), "找不到也要说明白");
+        assert_eq!(out[2].kind, "file");
+        assert_eq!(out[2].name, "笔记.txt");
+        assert!(out[2].note.is_empty(), "正常文件不该带多余的话");
+
+        // ⑥ 数量上限：一次拖 30 个只认前 20 个（前端会如实说"只接了前 20 个"）
+        let many: Vec<String> = (0..30).map(|i| format!("{}\\f{}.txt", base.display(), i)).collect();
+        assert_eq!(inspect_dropped_paths(many).len(), MAX_DROPPED_PATHS);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
