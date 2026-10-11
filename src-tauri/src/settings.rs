@@ -203,7 +203,7 @@ pub const DEFAULT_UPDATE_URL: &str = "https://pet.myheart.vip/latest.json";
 const AUTOSTART_PET_NAME: &str = "huohuo-pet.lnk";
 const AUTOSTART_WATCHDOG_NAME: &str = "huohuo-watchdog.lnk";
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct Store {
     /// **旧字段**：早期只支持 DeepSeek 时的密钥。现在密钥的统一入口是 `llm_api_key`；
     /// 这里保留是为了老配置升级后不用重填（`llm_api_key` 为空时会回落到它）。
@@ -336,6 +336,29 @@ struct Store {
     /// 会让那些规则一起消失（表情、文件白名单、回复格式全会坏）。
     #[serde(default)]
     persona: String,
+    /// ─── 手机 Telegram 的**远程控制开关**（安全审查 S1/S2 的修复）───
+    ///
+    /// 三个都默认 `false`，而且是**普通 bool**（不是 `Option<bool>`）：
+    /// 缺字段 = 关，这正是我们要的默认值。
+    ///
+    /// 为什么默认全关：Telegram 通道的绑定关系原来靠"谁先发消息谁绑上"，
+    /// 于是陌生人只要抢先发一条 `文件: …`，就能让桌宠在他自己的电脑上
+    /// 执行 PowerShell —— 审查报告的 S1+S2+S3 就是这么串成一条远程控制链的。
+    ///
+    /// 现在的模型是：
+    /// - **读文件、查天气这类只读操作**：手机随时可以用（这是这条通道的本职工作）；
+    /// - **写文件 / 发文件 / 执行命令**：默认全部拒绝，要主人在**电脑上**
+    ///   手动打开（攻击者能往 bot 发消息，但改不了这个文件 ——
+    ///   `%APPDATA%\desktop-pet` 已被 `agent_guard::is_protected_path` 拉黑）；
+    /// - 即使打开了 `tg_allow_command`，每条命令仍会在电脑上弹窗等主人点确认。
+    ///
+    /// 换句话说：**这三个开关是"主人自己决定要不要放权"，不是"程序猜"**。
+    #[serde(default)]
+    tg_allow_command: bool,
+    #[serde(default)]
+    tg_allow_write: bool,
+    #[serde(default)]
+    tg_allow_send: bool,
 }
 
 /// 性格文本的长度上限。每一次请求都会带上它，太长会把上下文挤满
@@ -344,6 +367,25 @@ pub const MAX_PERSONA_CHARS: usize = 1000;
 
 fn default_true() -> bool {
     true
+}
+
+impl Default for Store {
+    /// **手写 `Default`，而不是 `derive`。**（安全审查报告 B5）
+    ///
+    /// `#[derive(Default)]` 给 `bool` 填的是 `false`，而 `default_true` 只是
+    /// **serde 反序列化时**才生效的字段默认值 —— 两套默认值各说各话：
+    /// 配置文件不存在（全新安装）时 `load_from` 返回的是 `Store::default()`，
+    /// 于是 `update_auto_check` 是 `false`，新用户**永远不会自动检查更新**；
+    /// 更糟的是第一次保存会把这个 `false` 固化进配置文件，之后再也回不到默认值。
+    ///
+    /// 现在唯一的事实来源是字段上的 serde 属性：`Default` 就是「反序列化一个空对象」。
+    /// 这样「缺字段」和「文件不存在」两条路径必然得到同一份值，
+    /// 以后新增字段也不会再出现漏配默认值的情况
+    /// （真漏了 —— 比如加了非 `Option` 又没有 `#[serde(default)]` ——
+    /// 这里会直接 panic，测试立刻能看见，而不是静默给一个错的值）。
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("Store 必须能从空 JSON 对象反序列化出来")
+    }
 }
 
 /// 默认快捷键：装完即可用。挑组合的原则是"别撞常见软件的截图/输入法热键"：
@@ -366,13 +408,81 @@ fn settings_path() -> PathBuf {
 }
 
 fn load_from(path: &Path) -> Store {
-    match std::fs::read(path) {
-        // 用 telegram::strip_bom：记事本 / PowerShell 保存的 JSON 常带 UTF-8 BOM，
-        // 而 serde_json 遇到 BOM 会直接失败 —— 一失败就退化成"全空"，
-        // 面板看上去就是"设置全丢了"，然后用户重填、空值又覆盖回去，越滚越糟。
-        Ok(bytes) => serde_json::from_slice(crate::telegram::strip_bom(&bytes)).unwrap_or_default(),
-        Err(_) => Store::default(),
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        // 文件不存在 / 读不了 = 全新安装，用默认值。
+        Err(_) => return Store::default(),
+    };
+    // 用 telegram::strip_bom：记事本 / PowerShell 保存的 JSON 常带 UTF-8 BOM，
+    // 而 serde_json 遇到 BOM 会直接失败 —— 一失败就退化成"全空"，
+    // 面板看上去就是"设置全丢了"，然后用户重填、空值又覆盖回去，越滚越糟。
+    match serde_json::from_slice::<Store>(crate::telegram::strip_bom(&bytes)) {
+        Ok(s) => s,
+        Err(e) => recover_from_corrupt(path, &e),
     }
+}
+
+/// 上一版设置文件（`save_to` 每次覆盖前留的那一份）
+fn bak_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+/// 坏文件的留存名：`settings.json` → `settings.corrupt-1728567890.json`
+///
+/// 带上 `.json` 后缀是为了主人能直接双击用记事本打开 —— 里面很可能只是一处
+/// 类型写错，人工改一下就能把 API Key、Bot Token 全救回来。
+fn corrupt_path(path: &Path) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut candidate = path.with_extension(format!("corrupt-{ts}.json"));
+    let mut n = 1;
+    // 同一秒内坏两次（测试里很常见）也不能互相覆盖
+    while candidate.exists() {
+        candidate = path.with_extension(format!("corrupt-{ts}-{n}.json"));
+        n += 1;
+    }
+    candidate
+}
+
+/// 设置文件解析失败时的善后（审查报告 D1）。
+///
+/// 原来这里是 `unwrap_or_default()`：**一个字段写错（比如 `"pet_scale": "1.2"`）
+/// 整份设置就变成空的**，面板上所有值显示为默认，用户重填保存一次，
+/// 空配置就把磁盘上的真值盖掉了；连存两次连 `.bak` 也一起没了 —— 密钥永久丢失。
+///
+/// 现在的顺序是：
+/// 1. 坏文件**改名留存**（绝不原地覆盖，可能只错了一处）；
+/// 2. 先拿上一版 `.bak` 把设置救回来，并顺手把主文件补回一致；
+/// 3. `.bak` 也没有/也坏了，才以默认值启动 —— 而且**不写盘**，
+///    写盘只发生在下一次 `save_to`，那时坏文件已经留了底。
+fn recover_from_corrupt(path: &Path, err: &serde_json::Error) -> Store {
+    let bad = corrupt_path(path);
+    let kept = std::fs::rename(path, &bad).is_ok();
+
+    crate::telegram::log_line(&format!(
+        "⚠️ 设置文件解析失败（{}）；原文件{}留存为 [{}]，准备从上一版恢复",
+        err,
+        if kept { "已" } else { "**无法**" },
+        bad.display()
+    ));
+
+    // ① 先试上一版
+    if let Ok(bytes) = std::fs::read(bak_path(path)) {
+        if let Ok(s) = serde_json::from_slice::<Store>(crate::telegram::strip_bom(&bytes)) {
+            // 补回主文件：否则接下来每次读取都要重走这段恢复流程，
+            // 而且用户在面板上改的值会写进一个"刚从 .bak 恢复"的文件，
+            // 磁盘状态和界面状态长期对不上。
+            let _ = std::fs::copy(bak_path(path), path);
+            crate::telegram::log_line("✅ 已从 settings.json.bak 恢复设置");
+            return s;
+        }
+    }
+
+    // ② .bak 也指望不上：退回默认值（坏文件已经留住，不算丢数据）
+    crate::telegram::log_line("❌ settings.json.bak 也不可用，本次以默认值启动（原文件已留存）");
+    Store::default()
 }
 
 fn save_to(path: &Path, store: &Store) -> Result<(), String> {
@@ -576,16 +686,87 @@ pub fn llm_providers_json() -> serde_json::Value {
     )
 }
 
+/// 从 authority（`scheme://` 之后、第一个 `/` `?` `#` 之前的那一段）里取出主机名。
+///
+/// 为什么不能再用 `split(':').next()`：审查报告 S6 指出的绕过正是从这里来的。
+/// URL 的 authority 允许带用户名密码（`user:pass@host`）、允许带端口、
+/// IPv6 还要写成方括号。原来那种截法在 `http://127.0.0.1@evil.com/v1` 上
+/// 取出的是 `127.0.0.1@evil.com`，前缀匹配 `127.` 通过 ——
+/// **明文 http 被放行，API Key 明文发给了 evil.com**；
+/// 反过来合法的 `http://[::1]:11434` 又会被 `:` 截成 `[` 而被拒。
+fn host_of(authority: &str) -> Result<String, String> {
+    // 带 `@` 就是带了 userinfo。正经用户不会这么填，而它正是上面那个绕过的载体：
+    // 与其猜 `@` 后面那段是不是真主机，不如直接拒绝并让主人去掉。
+    if authority.contains('@') {
+        return Err("地址里不能带用户名密码（`@` 之前那一段）".to_string());
+    }
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6：`[::1]:11434`
+        match rest.split_once(']') {
+            Some((h, _port)) => h.to_string(),
+            None => return Err("IPv6 地址缺一个闭合的 `]`".to_string()),
+        }
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    };
+    if host.is_empty() {
+        return Err("里没看到主机名".to_string());
+    }
+    Ok(host)
+}
+
+/// 严格的 IPv4 解析：**必须正好四段十进制数字**。
+///
+/// `10.x.example.com`、`127.0.0.1.evil.com` 这类解不出来 → 一律不算本机地址。
+/// 前导零（`010.0.0.1`）也不认：Windows 的 inet_addr 会把它当八进制，
+/// 我们理解的地址和系统解析出的地址必须是同一个，否则这里就是个绕过口子。
+fn parse_ipv4(h: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = h.split('.');
+    for slot in out.iter_mut() {
+        let p = parts.next()?;
+        if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if p.len() > 1 && p.starts_with('0') {
+            return None;
+        }
+        *slot = p.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
 /// 本机地址（明文 http 只允许这些）——避免把密钥明文发到公网。
+///
+/// 每一项都必须是**完整匹配**，不能再用前缀/后缀猜：审查报告 S6 里
+/// `http://10.x.example.com` 会被 `starts_with("10.")` 放行，可那是个正经公网域名。
 fn is_local_host(host: &str) -> bool {
-    let h = host.to_ascii_lowercase();
-    h == "localhost"
-        || h == "::1"
-        || h == "[::1]"
-        || h.starts_with("127.")
-        || h.starts_with("192.168.")
-        || h.starts_with("10.")
-        || h.ends_with(".local")
+    let h = host.trim().to_ascii_lowercase();
+    if h == "localhost" || h == "::1" {
+        return true;
+    }
+    if let Some(ip) = parse_ipv4(&h) {
+        return ip[0] == 127                                // 127.0.0.0/8 回环
+            || ip[0] == 10                                 // 10.0.0.0/8 私有
+            || (ip[0] == 192 && ip[1] == 168)              // 192.168.0.0/16 私有
+            || (ip[0] == 172 && (16..=31).contains(&ip[1])) // 172.16.0.0/12 私有
+            || (ip[0] == 169 && ip[1] == 254);             // 169.254.0.0/16 链路本地
+    }
+    // `.local` 是 mDNS：只在同一段链路里解析，指不到公网。
+    // 但只认**单标签**主机名（`nas.local`）：`evil.com.local.hack.me` 这种
+    // 后缀匹配天然不会命中（它不以 `.local` 结尾），而 `a.b.local` 直接不认，
+    // 免得留一个"看起来是本机、实际由 DNS 说了算"的口子。
+    if let Some(name) = h.strip_suffix(".local") {
+        return !name.is_empty()
+            && !name.contains('.')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    }
+    false
 }
 
 /// 接口地址校验：空串合法（= 用预设默认）。
@@ -604,17 +785,11 @@ pub fn check_llm_base_url(v: &str) -> Result<String, String> {
             "「{v}」要以 http:// 或 https:// 开头（OpenAI 兼容接口通常长这样：https://api.deepseek.com/v1）"
         ));
     };
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if host.is_empty() {
-        return Err(format!("「{v}」里没看到主机名"));
-    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match host_of(authority) {
+        Ok(h) => h,
+        Err(why) => return Err(format!("「{v}」{why}")),
+    };
     if scheme == "http" && !is_local_host(&host) {
         return Err(format!(
             "明文 http 只允许本机地址（例如本地 Ollama 的 http://127.0.0.1:11434/v1）。\
@@ -886,6 +1061,27 @@ pub fn check_persona(v: &str) -> String {
         return t.to_string();
     }
     t.chars().take(MAX_PERSONA_CHARS).collect()
+}
+
+// ─── 手机 Telegram 的远程控制开关 ───
+//
+// 三个都默认 false，且都**只在这里读**（`agent_guard` 从 `chat_with_deepseek`
+// 拿到它们，再决定手机来的工具调用是放行还是拒绝）。
+// 读失败（文件坏了 / 读不到）时也必须返回 false —— 这里的失败方向只能是"更严"。
+
+/// 手机来的请求能不能执行命令（默认否）
+pub fn tg_allow_command() -> bool {
+    load_from(&settings_path()).tg_allow_command
+}
+
+/// 手机来的请求能不能写文件（默认否）
+pub fn tg_allow_write() -> bool {
+    load_from(&settings_path()).tg_allow_write
+}
+
+/// 手机来的请求能不能把文件发出去（默认否）
+pub fn tg_allow_send() -> bool {
+    load_from(&settings_path()).tg_allow_send
 }
 
 /// 私钥种子的"提示"形式：只露头尾各 4 位。
@@ -1161,6 +1357,11 @@ pub struct Patch {
     pub qweather_key_seed: Option<String>,
     /// 主人自定义的性格（空串 = 恢复内置人设）
     pub persona: Option<String>,
+    /// 手机 Telegram 的远程控制开关（见 `Store` 里那三项的说明）。
+    /// 不传 = 不动 —— 老版本前端不带这三个字段，不能让它们被静默关掉。
+    pub tg_allow_command: Option<bool>,
+    pub tg_allow_write: Option<bool>,
+    pub tg_allow_send: Option<bool>,
 }
 
 pub fn save(patch: Patch) -> Result<(), String> {
@@ -1205,6 +1406,9 @@ fn save_at(path: &Path, patch: Patch) -> Result<(), String> {
         qweather_credential_id,
         qweather_key_seed,
         persona,
+        tg_allow_command,
+        tg_allow_write,
+        tg_allow_send,
     } = patch;
     let mut s = load_from(path);
 
@@ -1352,6 +1556,30 @@ fn save_at(path: &Path, patch: Patch) -> Result<(), String> {
     if let Some(v) = persona {
         s.persona = check_persona(&v);
     }
+    // 手机远程控制开关：纯布尔，没有可校验的东西。
+    // 三个都写进日志 —— 这三个值决定了"手机能不能让电脑执行命令"，
+    // 出事时第一个要查的就是它们是什么时候被谁打开的。
+    if let Some(v) = tg_allow_command {
+        if v != s.tg_allow_command {
+            crate::telegram::log_line(&format!(
+                "⚙️ 设置变更：手机允许执行命令 = {}",
+                v
+            ));
+        }
+        s.tg_allow_command = v;
+    }
+    if let Some(v) = tg_allow_write {
+        if v != s.tg_allow_write {
+            crate::telegram::log_line(&format!("⚙️ 设置变更：手机允许写文件 = {}", v));
+        }
+        s.tg_allow_write = v;
+    }
+    if let Some(v) = tg_allow_send {
+        if v != s.tg_allow_send {
+            crate::telegram::log_line(&format!("⚙️ 设置变更：手机允许发送文件 = {}", v));
+        }
+        s.tg_allow_send = v;
+    }
 
     save_to(path, &s)
 }
@@ -1439,7 +1667,9 @@ $s.Description = 'Huohuo desktop pet'
 $s.Save()
 "#;
 
-    let out = std::process::Command::new("powershell")
+    // 走 lib.rs 的统一入口（B24）：它会带上 CREATE_NO_WINDOW，
+    // 否则每次开关开机自启都会闪一下黑色控制台窗口。
+    let out = crate::powershell()
         .args(["-NoProfile", "-Command", script])
         .env("HUOHUO_LNK", &lnk)
         .env("HUOHUO_EXE", exe)
@@ -1496,6 +1726,12 @@ pub fn snapshot() -> serde_json::Value {
         "volc_enabled": store.volc_enabled,
         "telegram_token": store.telegram_token,
         "has_telegram_token": telegram_token().is_some(),
+        // 手机远程控制开关（默认全关，见 Store 里那三项的说明）。
+        // 面板要把它们的**实际值**显示出来 —— 这一栏是"手机上能不能
+        // 让电脑执行命令"的总开关，不能让主人不知道它现在是开是关。
+        "tg_allow_command": store.tg_allow_command,
+        "tg_allow_write": store.tg_allow_write,
+        "tg_allow_send": store.tg_allow_send,
         "email_addr": store.email_addr,
         "email_auth": store.email_auth,
         "imap_server": store.imap_server,
@@ -1890,8 +2126,93 @@ mod tests {
         let _ = std::fs::remove_file(&bak);
     }
 
-    /// 非有限的大小必须**报错**而不是静默写坏值
-    /// （serde_json 会把 NaN/Inf 序列化成 null，之后谁也救不回来）
+    /// 审查报告 D1：原来一个字段写错（比如 `"pet_scale": "1.2"`），
+    /// `unwrap_or_default()` 就把**整份设置变成空的** —— 面板全空、用户重填、
+    /// 空值覆盖真值，连存两次连 `.bak` 也没了，密钥永久丢失。
+    ///
+    /// 现在的行为：先用上一版 `.bak` 救回来；坏文件一律改名留存，绝不原地覆盖。
+    #[test]
+    fn d1_broken_settings_recovered_from_backup_not_wiped() {
+        let p = temp_path("corrupt-recover");
+        let bak = p.with_extension("json.bak");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&bak);
+
+        // 磁盘上有一份好的设置（会被写成 .bak），随后主文件被手工编辑写坏
+        save_to(
+            &p,
+            &Store {
+                deepseek_api_key: "sk-good".into(),
+                weather_location: "广州市".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        save_to(
+            &p,
+            &Store {
+                deepseek_api_key: "sk-good".into(),
+                weather_location: "广州市".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(bak.exists(), "第二次写入应当留下上一版");
+
+        std::fs::write(&p, r#"{"pet_scale": "1.2"}"#).unwrap(); // 类型写错
+
+        let s = load_from(&p);
+        assert_eq!(
+            s.deepseek_api_key, "sk-good",
+            "必须从 .bak 把密钥救回来，而不是退化成空配置"
+        );
+        assert_eq!(s.weather_location, "广州市");
+        // 主文件被补回一致：否则每次读取都要重走恢复流程，磁盘与界面长期对不上
+        assert_eq!(load_from(&p).deepseek_api_key, "sk-good");
+
+        // 坏文件必须留着 —— 它可能只错了一处，人工改一下能救回全部密钥
+        let kept: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("corrupt-") && n.contains("corrupt-recover"))
+            .collect();
+        assert!(!kept.is_empty(), "坏文件必须改名留存，实际目录里没有 corrupt-* 文件");
+
+        for f in kept {
+            let _ = std::fs::remove_file(p.parent().unwrap().join(f));
+        }
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&bak);
+    }
+
+    /// D1 的另一半：连 `.bak` 也不可用时，仍然**不能**用空配置改写坏文件，
+    /// 而且不能 panic —— 以默认值启动，坏文件留着。
+    #[test]
+    fn d1_broken_settings_without_backup_keeps_the_bad_file() {
+        let p = temp_path("corrupt-nobak");
+        let bak = p.with_extension("json.bak");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&bak);
+
+        std::fs::write(&p, b"{ this is not json at all").unwrap();
+        let s = load_from(&p);
+        // 启动得起来（用默认值），而不是整个桌宠起不来
+        assert!(s.update_auto_check, "退回默认值时也要是「自动检查更新」开着");
+
+        // 坏文件的内容必须还在（改名留存），没有被空配置覆盖
+        let found = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().contains("corrupt-nobak"));
+        let found = found.expect("坏文件必须留存下来");
+        let text = std::fs::read_to_string(found.path()).unwrap();
+        assert!(text.contains("not json"), "留存下来的必须是原文件内容");
+
+        let _ = std::fs::remove_file(found.path());
+        let _ = std::fs::remove_file(&p);
+    }
+
     #[test]
     fn non_finite_pet_scale_is_rejected() {
         let p = temp_path("nan");
@@ -2513,6 +2834,78 @@ mod tests {
         assert!(check_llm_base_url("http://localhost:1234/v1").is_ok());
         assert!(check_llm_base_url("http://api.example.com/v1").is_err());
         assert!(check_llm_base_url("https://api.example.com/v1").is_ok());
+    }
+
+    /// 安全审查 S6：「本机地址」判断原来只用 `split(':')` 截一下再做前缀匹配，
+    /// 于是这几种写法会被当成"本机"放行，**API 密钥明文发给公网**。
+    #[test]
+    fn s6_local_host_check_cannot_be_bypassed() {
+        // ① userinfo 绕过：URL 里 `@` 之前是用户名密码，真正的主机是 evil.com。
+        //    原来的截法取出 `127.0.0.1@evil.com`，`starts_with("127.")` 直接放过。
+        assert!(check_llm_base_url("http://127.0.0.1@evil.com/v1").is_err());
+        assert!(check_llm_base_url("http://localhost@evil.com/v1").is_err());
+        assert!(check_llm_base_url("http://10.0.0.1:8080@evil.com/v1").is_err());
+        // ② 把本机地址当成域名前缀：`127.0.0.1.evil.com`、`10.x.example.com` 都是公网域名
+        assert!(check_llm_base_url("http://127.0.0.1.evil.com/v1").is_err());
+        assert!(check_llm_base_url("http://10.x.example.com/v1").is_err());
+        assert!(check_llm_base_url("http://192.168.1.1.evil.com/v1").is_err());
+        // ③ 八进制在前导零上做文章（Windows 的 inet_addr 会当八进制解析）
+        assert!(check_llm_base_url("http://0177.0.0.1/v1").is_err());
+        // ④ 172.32 不在私有段 172.16.0.0/12 里，不能因为 `172.` 就放过
+        assert!(check_llm_base_url("http://172.32.0.9/v1").is_err());
+        // ⑤ `.local` 只认单标签，`a.b.local` 那种交给 DNS 说了算，不算本机
+        assert!(check_llm_base_url("http://a.b.local/v1").is_err());
+
+        // 反过来，真正的本机地址一个都不能被误杀
+        for ok in [
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434/v1", // 原来这条是**被拒**的（先被 `:` 截成 `[`）
+            "http://localhost/v1",
+            "http://10.0.0.5/v1",
+            "http://192.168.31.7/v1",
+            "http://172.16.0.9/v1",
+            "http://172.31.255.254/v1",
+            "http://169.254.1.1/v1",
+            "http://nas.local/v1",
+        ] {
+            assert!(
+                check_llm_base_url(ok).is_ok(),
+                "{ok} 是本机地址，不该被拒: {:?}",
+                check_llm_base_url(ok)
+            );
+        }
+    }
+
+    /// 审查报告 B5：`Store` 原来是 `#[derive(Default)]`，它给 `update_auto_check`
+    /// 填的是 `false`（`default_true` 只在 serde 反序列化时生效）。
+    /// 配置文件不存在（全新安装）走的就是 `Store::default()` 这条路 ——
+    /// 新用户永远不会自动检查更新，而第一次保存还会把这个 false 固化下去。
+    #[test]
+    fn b5_default_store_equals_empty_json() {
+        let d = Store::default();
+        assert!(d.update_auto_check, "全新安装必须默认开启「启动时自动检查更新」");
+        // 唯一事实来源：Default 就是「反序列化一个空对象」，
+        // 以后新增字段也不会出现「derive 的默认值」和「serde 的默认值」两套值打架
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::to_value(serde_json::from_str::<Store>("{}").unwrap()).unwrap()
+        );
+        assert_eq!(
+            hotkey_or_default(&d.hotkey_chat, default_hotkey_chat()),
+            "Ctrl+Alt+H"
+        );
+        assert_eq!(
+            hotkey_or_default(&d.hotkey_toggle, default_hotkey_toggle()),
+            "Ctrl+Alt+Q"
+        );
+        assert_eq!(
+            hotkey_or_default(&d.hotkey_action, default_hotkey_action()),
+            "Ctrl+Alt+F9"
+        );
+        // 凭据类一律默认空，不替用户做主（工作区约定）
+        assert!(d.llm_api_key.is_empty() && d.telegram_token.is_empty());
+        // 手机远程控制三个开关必须默认关，缺字段 = 关
+        assert!(!d.tg_allow_command && !d.tg_allow_write && !d.tg_allow_send);
     }
 
     /// 模型名与服务商 id 的校验。

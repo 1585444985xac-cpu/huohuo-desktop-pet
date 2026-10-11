@@ -86,6 +86,36 @@ pub fn canonical(m: &Manifest) -> String {
     )
 }
 
+/// 更新地址（清单地址、安装包地址）能不能接受。
+///
+/// 为什么 http 一律不要（S8）：签名只保证"这份清单确实是发布者签的"，
+/// 保证不了"你现在看到的就是服务器上那一份"。走 http 时中间人可以把上次抓到、
+/// 或自己存下的**一份旧清单连同旧安装包**整套给你 —— 签名照样验得过，
+/// 于是主人被退回有已知漏洞的版本（回滚攻击）。
+///
+/// 例外只给本机地址（`127.0.0.1` / `localhost` / `[::1]`）：本地起个静态服务
+/// 走一遍更新流程是开发时的常规做法，流量不出网卡，"中间人"这个角色根本不存在。
+/// 注意这里刻意剥掉了 userinfo / 端口 / 路径 / 片段：`http://127.0.0.1@evil.com/x`
+/// 的 host 其实是 evil.com，绝不能被那串"看起来像本机"的前缀骗过去。
+fn is_acceptable_url(url: &str) -> bool {
+    let u = url.trim().to_ascii_lowercase();
+    if u.starts_with("https://") {
+        return true;
+    }
+    let rest = match u.strip_prefix("http://") {
+        Some(r) => r,
+        None => return false,
+    };
+    // 顺序：先砍路径/查询/片段 → 再砍 user:pass@ → 最后砍端口
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match hostport.find(']') {
+        Some(end) => &hostport[..=end], // [::1]:8080 → [::1]
+        None => hostport.split(':').next().unwrap_or(""),
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+}
+
 impl Manifest {
     /// 解析 + 基本校验。**不**验签（验签要单独调用，好让报错分得清）。
     pub fn parse(json: &str) -> Result<Self, String> {
@@ -94,8 +124,11 @@ impl Manifest {
         if m.url.trim().is_empty() || m.sha256.trim().is_empty() {
             return Err("清单缺少 url 或 sha256".to_string());
         }
-        if !(m.url.starts_with("https://") || m.url.starts_with("http://")) {
-            return Err(format!("清单里的下载地址必须是 http/https：{}", m.url));
+        if !is_acceptable_url(&m.url) {
+            return Err(format!(
+                "清单里的下载地址必须是 https（http 只允许本机 127.0.0.1 / localhost 调试用）：{}",
+                m.url
+            ));
         }
         if m.sha256.len() != 64 || !m.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err("清单里的 sha256 看着不是 64 位十六进制".to_string());
@@ -139,6 +172,34 @@ impl Manifest {
 /// 清单里的版本是不是比本机新
 pub fn is_newer(m: &Manifest, local_code: i64) -> bool {
     m.version_code > local_code
+}
+
+/// 拒绝回滚：要装的东西必须**严格**比本机新（S8）。
+///
+/// 验签只回答"这是不是发布者给的"，回答不了"它是不是比我这版新"。
+/// 服务器被攻破（或 DNS / 证书被劫持）时，攻击者可以推一份**签名合法**的旧清单，
+/// 里面的 `version_code` 更小、安装包也是真的旧版本 —— 装上就把主人退回了
+/// 有已知漏洞的版本。所以下载/安装前必须再比一次版本，判据和 `check()` 完全一致
+/// （`build_epoch()` 这个单调递增的构建戳），不引入第二套版本口径。
+pub fn ensure_not_downgrade(m: &Manifest, local_code: i64) -> Result<(), String> {
+    if !is_newer(m, local_code) {
+        return Err(format!(
+            "已拒绝安装：这份更新（version_code {}，{}）不比本机（build {}）新 —— 只允许升级，不允许被退回旧版本",
+            m.version_code, m.version, local_code
+        ));
+    }
+    Ok(())
+}
+
+/// 更新地址（清单地址）本身也只认 https / 本机地址（S8）。
+fn ensure_update_url_ok(url: &str) -> Result<(), String> {
+    if is_acceptable_url(url) {
+        return Ok(());
+    }
+    Err(format!(
+        "更新地址必须是 https（http 只允许本机 127.0.0.1 / localhost 调试用）：{}",
+        url
+    ))
 }
 
 /// 本机是不是"安装版"（NSIS 默认装到 `%LOCALAPPDATA%\Programs\<name>`）。
@@ -253,6 +314,7 @@ pub async fn check() -> Result<serde_json::Value, String> {
                 .to_string(),
         );
     }
+    ensure_update_url_ok(url.trim())?;
     let body = fetch_text(url.trim()).await?;
     let m = Manifest::parse(&body)?;
     m.verify_signature(UPDATE_PUBKEY_HEX)?; // 先验证来源，再谈新旧
@@ -301,21 +363,18 @@ fn emit_progress(app: &tauri::AppHandle, phase: &str, got: u64, total: u64, text
 /// - 自己的国内 VPS：梯子如果是全局模式，反而可能绕远、甚至被节点挡住。
 /// 只认一种就会在其中一种情况下"永远连不上更新地址"。
 async fn fetch_text(url: &str) -> Result<String, String> {
+    let client_list = clients()?;
+    let total = client_list.len();
     let mut last = String::new();
-    for (i, client) in clients()?.into_iter().enumerate() {
-        match client.get(url).send().await {
-            Ok(resp) => {
-                let code = resp.status();
-                if !code.is_success() {
-                    return Err(format!("更新地址返回 HTTP {}", code.as_u16()));
-                }
-                return resp.text().await.map_err(|e| format!("读清单失败: {}", e));
-            }
-            Err(e) => {
-                last = format!("{}", e);
-                if i == 0 {
+    for (i, client) in client_list.iter().enumerate() {
+        match fetch_text_once(client, url).await {
+            Ok(body) => return Ok(body),
+            Err(reason) => {
+                last = reason;
+                // 非 2xx（代理 502/403 最常见）和连不上一样，都该换下一条腿（B16）
+                if after_failure(i, total) == Next::Retry {
                     crate::telegram::log_line(&format!(
-                        "[update] 走代理取清单失败（{}），改直连再试一次",
+                        "[update] 这条线路取清单失败（{}），改下一条再试",
                         last
                     ));
                 }
@@ -325,46 +384,140 @@ async fn fetch_text(url: &str) -> Result<String, String> {
     Err(format!("连不上更新地址: {}", last))
 }
 
+/// 用一条线路取一次清单。**任何**失败（HTTP 状态不对、读不出正文、连不上）
+/// 都只是 `Err`，由调用方决定换不换下一条腿。
+async fn fetch_text_once(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let resp = client.get(url).send().await.map_err(|e| format!("{}", e))?;
+    let code = resp.status().as_u16();
+    if !response_is_usable(code) {
+        return Err(format!("更新地址返回 HTTP {}", code));
+    }
+    resp.text().await.map_err(|e| format!("读清单失败: {}", e))
+}
+
+/// 单次更新下载的大小上限（B15）。
+///
+/// 当前安装包约 10 MB（含 Live2D 模型）；给到 128 MB 是为了将来换更大的模型也够用，
+/// 同时远低于"能让进程被系统杀掉"的量级。**这个上限是本机常量，不是清单里的 `size`** ——
+/// `size` 不在签名覆盖范围内，可以被人随手改成天文数字。
+const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+
+/// 预分配时的封顶（B15）：别按远端报的数一次要内存。
+/// 典型安装包 10 MB，先要 8 MB 就够避免绝大多数重复分配，又不至于被骗走一大块内存。
+const PREALLOC_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 远端声明的长度是不是已经超上限（超了就别开始下）
+fn declared_too_big(declared: u64) -> bool {
+    declared > MAX_DOWNLOAD_BYTES
+}
+
+/// 预分配多少容量：**只信到封顶为止**
+fn prealloc_capacity(declared: u64) -> usize {
+    declared.min(PREALLOC_CAP_BYTES) as usize
+}
+
+/// 边下边算：加上这一块会不会超上限（超了立刻中止）。
+/// 用 `saturating_add`：万一长度真的顶到 usize 上限，也不能靠溢出绕过去。
+fn would_exceed_limit(current: usize, incoming: usize) -> bool {
+    (current as u64).saturating_add(incoming as u64) > MAX_DOWNLOAD_BYTES
+}
+
+/// 只有 2xx 才算成功；其余（代理 502/403、被劫持的 404…）都当"这条腿不行"
+fn response_is_usable(code: u16) -> bool {
+    (200..300).contains(&code)
+}
+
+/// 一次次尝试之后的走向（B16）。
+///
+/// 单独抽出来，是因为这条 bug 的本质就是"决策写错了"：老实现见到非 2xx 直接
+/// `return Err`，注释里承诺的"先代理后直连"从来没发生过 —— 梯子挂掉时国内 VPS
+/// 也一起用不了。做成纯函数后，测试不用发真实请求就能钉住这个语义。
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// 换下一条腿再试
+    Retry,
+    /// 没得试了，交上层报错
+    GiveUp,
+}
+
+fn after_failure(index: usize, total: usize) -> Next {
+    if index + 1 < total {
+        Next::Retry
+    } else {
+        Next::GiveUp
+    }
+}
+
 /// 下载安装包（同样先代理后直连），边下边报进度
 async fn download_bytes(
     app: &tauri::AppHandle,
     url: &str,
     expect_size: u64,
 ) -> Result<Vec<u8>, String> {
+    let client_list = clients()?;
+    let total = client_list.len();
     let mut last = String::new();
-    for (i, client) in clients()?.into_iter().enumerate() {
-        match client.get(url).send().await {
-            Ok(mut resp) => {
-                let code = resp.status();
-                if !code.is_success() {
-                    return Err(format!("下载地址返回 HTTP {}", code.as_u16()));
-                }
-                let total = resp.content_length().unwrap_or(expect_size);
-                let mut bytes: Vec<u8> = Vec::with_capacity(total as usize);
-                loop {
-                    match resp.chunk().await {
-                        Ok(Some(chunk)) => {
-                            bytes.extend_from_slice(&chunk);
-                            emit_progress(app, "download", bytes.len() as u64, total, "正在下载");
-                        }
-                        Ok(None) => return Ok(bytes),
-                        Err(e) => {
-                            last = format!("下载中断: {}", e);
-                            break; // 换直连/换代理重来
-                        }
-                    }
-                }
-                if i == 1 {
-                    return Err(last);
+    for (i, client) in client_list.iter().enumerate() {
+        match download_once(app, client, url, expect_size).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(reason) => {
+                last = reason;
+                // B16：非 2xx 也要落到下一条腿，而不是直接报错收工
+                if after_failure(i, total) == Next::Retry {
+                    crate::telegram::log_line(&format!(
+                        "[update] 这条线路下载失败（{}），改下一条再试",
+                        last
+                    ));
                 }
             }
-            Err(e) => last = format!("{}", e),
-        }
-        if i == 0 {
-            crate::telegram::log_line(&format!("[update] 走代理下载失败（{}），改直连重试", last));
         }
     }
     Err(format!("下载失败: {}", last))
+}
+
+/// 用一条线路下载一次：HTTP 状态、大小上限、传输中断都在这里管。
+async fn download_once(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    url: &str,
+    expect_size: u64,
+) -> Result<Vec<u8>, String> {
+    let mut resp = client.get(url).send().await.map_err(|e| format!("{}", e))?;
+    let code = resp.status().as_u16();
+    if !response_is_usable(code) {
+        return Err(format!("下载地址返回 HTTP {}", code));
+    }
+
+    // 远端报的长度（Content-Length 优先，否则清单里的 size）只能当**参考**：
+    // 两个都可能被改（size 根本不在签名覆盖范围内），所以既不许直接拿它开内存，
+    // 也要先做上限检查 —— 原来的 `Vec::with_capacity(total as usize)` 遇到
+    // 一个天文数字会直接分配失败，整个进程被系统杀掉（B15）。
+    let declared = resp.content_length().unwrap_or(expect_size);
+    if declared_too_big(declared) {
+        return Err(format!(
+            "安装包声明的大小 {} 字节超过本机上限 {} 字节，已中止（清单里的 size 不在签名保护范围内，不能信）",
+            declared, MAX_DOWNLOAD_BYTES
+        ));
+    }
+
+    let mut bytes: Vec<u8> = Vec::with_capacity(prealloc_capacity(declared));
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                // 远端可以一边报小长度一边灌大内容，所以每一块都要再量一次
+                if would_exceed_limit(bytes.len(), chunk.len()) {
+                    return Err(format!(
+                        "下载内容超过本机上限 {} 字节，已中止",
+                        MAX_DOWNLOAD_BYTES
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+                emit_progress(app, "download", bytes.len() as u64, declared, "正在下载");
+            }
+            Ok(None) => return Ok(bytes),
+            Err(e) => return Err(format!("下载中断: {}", e)),
+        }
+    }
 }
 
 /// 两个 HTTP 客户端：第一个跟随系统代理（梯子），第二个显式不走代理。
@@ -396,10 +549,14 @@ pub async fn download(app: &tauri::AppHandle) -> Result<(Manifest, PathBuf), Str
     if url.trim().is_empty() {
         return Err("还没填更新地址".to_string());
     }
+    ensure_update_url_ok(url.trim())?;
     emit_progress(app, "manifest", 0, 0, "正在获取版本清单…");
     let body = fetch_text(url.trim()).await?;
     let m = Manifest::parse(&body)?;
     m.verify_signature(UPDATE_PUBKEY_HEX)?;
+    // 来源没问题了，再挡住"签名合法的旧版本"（S8，回滚攻击）——
+    // 放在下载之前：连旧安装包都不必下下来。
+    ensure_not_downgrade(&m, build_epoch())?;
 
     emit_progress(app, "download", 0, m.size, "正在下载");
     let bytes = download_bytes(app, &m.url, m.size).await?;
@@ -594,6 +751,82 @@ mod tests {
         let _ = std::fs::remove_file(&exe);
         let _ = std::fs::remove_file(&not);
         let _ = std::fs::remove_file(&tiny);
+    }
+
+    /// S8：回滚攻击 —— 签名合法但版本更旧/相同，一律拒；http 的公网地址也拒
+    #[test]
+    fn s8_downgrade_and_plain_http_are_rejected() {
+        // 低版本 / 相同版本都不算升级
+        let mut m = sample();
+        m.version_code = 1_791_515_000;
+        assert!(ensure_not_downgrade(&m, 1_791_515_000).is_err(), "同版本不算更新");
+        assert!(ensure_not_downgrade(&m, 1_791_515_001).is_err(), "旧版本必须拒");
+        let e = ensure_not_downgrade(&m, 1_791_515_001).unwrap_err();
+        assert!(e.contains("旧版本"), "报错要让人看懂：{}", e);
+        m.version_code += 1;
+        assert!(ensure_not_downgrade(&m, 1_791_515_000).is_ok(), "更新的版本要放行");
+
+        let parsed_url = |url: &str| {
+            let mut m = sample();
+            m.url = url.to_string();
+            Manifest::parse(&serde_json::to_string(&m).unwrap()).map(|m| m.url)
+        };
+
+        // http 的公网地址：中间人可以把整份旧清单 + 旧安装包一起换给你
+        assert!(parsed_url("http://pet.example.com/x.exe").is_err(), "公网 http 必须拒");
+        assert!(parsed_url("http://10.0.0.5:8080/x.exe").is_err(), "内网 http 也拒");
+        // 用 userinfo / 子域名伪装成本机地址的都不行
+        assert!(parsed_url("http://127.0.0.1@evil.example.com/x.exe").is_err());
+        assert!(parsed_url("http://localhost.evil.example.com/x.exe").is_err());
+        // https 照常放行
+        assert!(parsed_url("https://pet.example.com/x.exe").is_ok(), "https 必须放行");
+        // 本地开发用的本机地址放行（注释里写明了理由）
+        assert!(parsed_url("http://127.0.0.1:8000/x.exe").is_ok());
+        assert!(parsed_url("http://localhost:8000/latest.json").is_ok());
+        assert!(parsed_url("http://[::1]:8000/latest.json").is_ok());
+
+        // 清单地址本身也走同一套判断
+        assert!(ensure_update_url_ok("https://pet.example.com/latest.json").is_ok());
+        assert!(ensure_update_url_ok("http://pet.example.com/latest.json").is_err());
+        assert!(ensure_update_url_ok("http://127.0.0.1:8000/latest.json").is_ok());
+    }
+
+    /// B15：伪造一个超大 size / Content-Length，不能拿它去申请内存
+    #[test]
+    fn b15_huge_declared_size_cannot_trigger_huge_allocation() {
+        // 清单里的 size 不在签名覆盖范围内，攻击者可以写 u64::MAX
+        assert!(declared_too_big(u64::MAX));
+        assert!(declared_too_big(MAX_DOWNLOAD_BYTES + 1));
+        assert!(!declared_too_big(MAX_DOWNLOAD_BYTES));
+
+        // 预分配有硬封顶：不管远端写多少，最多只要 PREALLOC_CAP_BYTES
+        assert_eq!(prealloc_capacity(u64::MAX), PREALLOC_CAP_BYTES as usize);
+        assert_eq!(prealloc_capacity(u32::MAX as u64), PREALLOC_CAP_BYTES as usize);
+        assert_eq!(prealloc_capacity(1234), 1234);
+        assert!(prealloc_capacity(u64::MAX) < MAX_DOWNLOAD_BYTES as usize);
+
+        // 边下边算的边界：刚好到上限可以，再多一个字节就中止；
+        // 也不能靠加法溢出（usize 顶到上限再 +1）绕过上限
+        assert!(!would_exceed_limit(MAX_DOWNLOAD_BYTES as usize - 1, 1));
+        assert!(would_exceed_limit(MAX_DOWNLOAD_BYTES as usize, 1));
+        assert!(would_exceed_limit(usize::MAX, 1));
+    }
+
+    /// B16：非 2xx（代理 502/403…）必须落到下一个客户端，而不是直接收工
+    #[test]
+    fn b16_non_2xx_falls_through_to_next_client() {
+        for code in [400u16, 403, 404, 407, 500, 502, 503] {
+            assert!(!response_is_usable(code), "只有 2xx 算成功，{} 不是", code);
+        }
+        assert!(response_is_usable(200));
+        assert!(response_is_usable(206));
+        assert!(response_is_usable(299));
+
+        // 代理（第 0 条腿）返回 502 → 还有直连这条腿，必须换过去试
+        assert_eq!(after_failure(0, 2), Next::Retry);
+        // 两条腿都试完了才报错
+        assert_eq!(after_failure(1, 2), Next::GiveUp);
+        assert_eq!(after_failure(0, 1), Next::GiveUp);
     }
 
     /// tasklist 解析：只挑别的进程，绝不把自己算进去

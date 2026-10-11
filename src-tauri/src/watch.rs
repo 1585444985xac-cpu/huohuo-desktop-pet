@@ -213,21 +213,16 @@ async fn loop_forever() {
             continue;
         }
 
-        // 白名单：与桌宠共用同一份绑定关系；一个都没有时就认领第一个会话
-        let mut bound: Vec<i64> = store.chats.iter().map(|c| c.chat_id).collect();
-        if bound.is_empty() {
-            if let Some(first) = updates.iter().find_map(parse_update) {
-                store.chats.push(telegram::TgChat {
-                    chat_id: first.chat_id,
-                    title: String::new(),
-                    username: String::new(),
-                    bound_at: telegram::now_secs(),
-                });
-                store.save();
-                telegram::log_line(&format!("[watchdog] 绑定会话 chat_id={}", first.chat_id));
-                bound.push(first.chat_id);
-            }
-        }
+        // 白名单：与桌宠共用同一份绑定关系。
+        //
+        // 安全审查 S3：以前这里在"一个会话都没绑定"时会**自动认领**
+        // 收到的第一个会话 —— 而看门狗的时间窗比桌宠本体更宽
+        // （桌宠没开的时候也一直在轮询），等于把"抢先绑定"的机会又放大了一层。
+        //
+        // 现在看门狗**只读不写**这份绑定关系：绑定只能由桌宠本体那边
+        // 用配对码完成（码只显示在主人电脑屏幕上）。一个都没绑定时，
+        // 看门狗什么都不做 —— 主人这时本来就该在电脑前完成配对。
+        let bound: Vec<i64> = store.chats.iter().map(|c| c.chat_id).collect();
 
         let items: Vec<Incoming> = updates
             .iter()
@@ -239,7 +234,12 @@ async fn loop_forever() {
 
         // 关键：整批吃掉。绝不把「启动」留给稍后起来的桌宠 ——
         // 那会把口令喂给大模型，文件模式下它可能真的去执行"启动"。
-        store.offset = plan.new_offset;
+        //
+        // 游标同时要按**原始 update_id** 推进（审查报告 B9）：
+        // `plan.new_offset` 只看得到"已绑定会话发来的文字消息"，
+        // 贴纸/图片/陌生人私聊一律不计数 —— 那样的批次会让 offset 原地不动，
+        // 同一批 updates 被反复拉取、每轮还写一次盘，一直空转到主人自己发文字为止。
+        store.offset = plan.new_offset.max(raw_next_offset(&updates, store.offset));
         store.save();
 
         // 刚从断线里恢复：把"断了多久"附在这次的回复里。
@@ -448,6 +448,27 @@ struct BatchPlan {
     new_offset: i64,
 }
 
+/// 这一批**原始** updates 里最大的 `update_id + 1`（不做任何过滤）。
+///
+/// 安全审查 B9：看门狗原来只用"解析成功、且来自已绑定会话的文字消息"
+/// 来推进 offset（就是 [`plan_batch`] 的 `new_offset`）。桌宠没开的时候，
+/// 只要有人发来贴纸、图片，或者陌生人私聊，这批 updates 就一条都不算数 ——
+/// offset 原地不动，于是**同一批消息被反复拉取、每轮还写一次盘**，
+/// 一直空转到主人自己发一条文字为止。
+///
+/// 现在游标一律按原始 `update_id` 推进：「看过」的批次就该确认掉，
+/// 认不认识、要不要回是另一回事（白名单只该影响回复，不该影响游标）。
+/// 取 `max(current)` 是为了绝不把 offset 往回退。
+fn raw_next_offset(updates: &[serde_json::Value], current: i64) -> i64 {
+    updates
+        .iter()
+        .filter_map(|u| u["update_id"].as_i64())
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(current)
+        .max(current)
+}
+
 fn plan_batch(items: &[Incoming], start_offset: i64) -> BatchPlan {
     let mut launch_chat = None;
     let mut hint_chat = None;
@@ -643,6 +664,53 @@ mod tests {
         assert_eq!(plan.new_offset, 669160144);
         assert_eq!(plan.launch_chat, None);
         assert_eq!(plan.hint_chat, None);
+    }
+
+    /// 审查报告 B9：offset 必须按**原始** update_id 推进。
+    ///
+    /// 桌宠没开的时候，贴纸 / 图片 / 陌生人私聊在 `plan_batch` 里一条都不算数
+    /// （它只看已绑定会话的文字消息），于是 offset 原地不动 ——
+    /// 同一批 updates 被反复拉取、每轮还写一次盘，一直空转到主人自己发文字为止。
+    #[test]
+    fn b9_offset_advances_on_unusable_updates() {
+        // 一批全是"用不上"的消息：贴纸 + 陌生人私聊 + 群聊
+        let updates = vec![
+            serde_json::json!({
+                "update_id": 500,
+                "message": {"chat": {"id": 999, "type": "private"}, "sticker": {"file_id": "x"}}
+            }),
+            serde_json::json!({
+                "update_id": 501,
+                "message": {"chat": {"id": 888, "type": "private"}, "text": "你好"}
+            }),
+            serde_json::json!({
+                "update_id": 502,
+                "message": {"chat": {"id": 5, "type": "group"}, "text": "启动"}
+            }),
+        ];
+        // 过滤之后一条都不剩。注意这里要**完整复刻真实管线**：
+        // 先 parse_update（只认私聊文字），再按绑定关系过滤（看门狗只读这份名单，
+        // 一个都没绑定时什么都不认）—— 少了绑定这一层，501 那条陌生人的
+        // 文字消息会被算进来，测试就测不到 B9 的场景了。
+        let bound: Vec<i64> = Vec::new();
+        let items: Vec<Incoming> = updates
+            .iter()
+            .filter_map(parse_update)
+            .filter(|i| bound.contains(&i.chat_id))
+            .collect();
+        assert!(items.is_empty(), "这一批本来就该被全部过滤掉");
+
+        let plan = plan_batch(&items, 500);
+        assert_eq!(plan.new_offset, 500, "plan_batch 自己推不动游标（这就是 bug 现场）");
+
+        // 加上原始 update_id 的兜底之后，游标必须前进到 503
+        assert_eq!(raw_next_offset(&updates, 500), 503);
+        assert_eq!(plan.new_offset.max(raw_next_offset(&updates, 500)), 503);
+
+        // 游标绝不后退：一批老 update 不能把已经推进过的 offset 拉回去
+        assert_eq!(raw_next_offset(&updates, 900), 900);
+        // 空批次也不动
+        assert_eq!(raw_next_offset(&[], 900), 900);
     }
 
     /// 非私聊/非文字的消息不该被当成对话内容

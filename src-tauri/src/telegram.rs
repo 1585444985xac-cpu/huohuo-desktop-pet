@@ -80,8 +80,37 @@ const HELP_TEXT: &str = "🐾 藿藿的 Telegram 通道已接通
 /mode 切换模式（点按钮，不用打字）
 /status 查看通道状态
 /id 查看你的 chat_id
-/unbind 解绑（解绑后需要重新发消息绑定）
-/help 显示这份说明";
+/unbind 解绑（解绑后要重新配对才能用）
+/help 显示这份说明
+
+⚠️ 手机能做的事**默认只有「看」**：读文件、查天气没问题；
+写文件 / 把文件发回手机 / 执行命令都由主人在电脑上单独放权
+（⚙️ 设置 → 「📱 手机远程控制」，默认全关），
+而且执行命令时每条都会在那台电脑上弹窗等他点确认。";
+
+/// 还没配对时发回去的说明（第一次给 bot 发消息的人都会看到它）。
+///
+/// 措辞里必须写清"去哪里看码"：配对是这个功能新增的一道门，
+/// 只说"未绑定"会让人完全不知道下一步做什么（而这个项目的规矩是
+/// **失败必须看得见**，静默忽略一律当 bug 处理）。
+fn pair_hint(chat_id: i64, has_token: bool) -> String {
+    let where_to_look = if has_token {
+        "配对码就在**电脑上那台桌宠**里：\n\
+         ⚙️ 设置 → 「📱 Telegram」→ 「🔐 手机配对码」（点聊天面板标题栏的 📱 也能看到）"
+    } else {
+        "不过这台电脑上还**没填 Bot Token** —— 先在桌宠的 ⚙️ 设置 →「📱 Telegram」\
+         里把 token 配上，配对码才会出现"
+    };
+    format!(
+        "🔐 这台桌宠还没有绑定任何会话，需要先配对。\n\n\
+         {}\n\n\
+         把它显示的 **6 位数字**直接发给我就行（发 `123456` 这样一串数字）。\n\n\
+         配对码 10 分钟内有效、只显示在电脑屏幕上、用掉就作废 ——\n\
+         这一步是为了防止陌生人抢先绑上你的桌宠（以前谁先发消息谁就绑上了）。\n\n\
+         你的 chat_id 是 {}。",
+        where_to_look, chat_id
+    )
+}
 
 /// 三个模式的对应关系：(斜杠命令, 键盘按钮文案, 转发给前端的口令)
 ///
@@ -201,6 +230,57 @@ pub(crate) fn err_chain(e: &dyn std::error::Error) -> String {
         out.push_str(" <- ");
         out.push_str(&s.to_string());
         cur = s.source();
+    }
+    // 安全审查 S7：**先抹掉 Bot Token 再往外给**
+    redact_token(&out)
+}
+
+/// 把文本里的 Telegram Bot Token 抹掉（安全审查 S7）。
+///
+/// # 为什么必须做
+///
+/// **Token 就在 URL 里**：`https://api.telegram.org/bot<数字>:<密钥>/getUpdates`。
+/// reqwest 的错误 `Display` 会把整条 URL 原样带上，而这些字符串会：
+/// 1. 写进 `%APPDATA%\desktop-pet\telegram.log`；
+/// 2. `/status` 命令还会把 `last_error` 发回 Telegram。
+///
+/// 而 README 恰恰让用户"出问题就把日志贴出来看看" —— 等于让 bot token
+/// 在聊天记录和论坛帖子里到处跑。拿到 token 的人可以完全接管这个 bot
+/// （读所有消息、冒充它发消息）。
+///
+/// # 为什么不用 `reqwest::Error::without_url()`
+///
+/// 它要**按值**消耗错误对象，而这里不少调用点手上只有 `&dyn Error`
+/// （`err_chain` 的参数就是 trait 对象）；而且它只去掉 URL 本身，
+/// 别的字段（某些代理错误会把请求行一起带出来）仍可能夹着 token。
+/// 正则式地在**最终字符串**上抹一遍，覆盖面更宽、也不会漏掉嵌套的 source。
+pub(crate) fn redact_token(text: &str) -> String {
+    // Token 形态：`bot` + 一串数字 + `:` + 一段 URL-safe 的密钥（30 多个字符）
+    const MIN_SECRET: usize = 10;
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < text.len() {
+        if text[i..].starts_with("bot") {
+            let rest = &text[i + 3..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let after_digits = &rest[digits.len()..];
+            if !digits.is_empty() && after_digits.starts_with(':') {
+                let tail = &after_digits[1..];
+                let secret: String = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                if secret.len() >= MIN_SECRET {
+                    out.push_str("bot<已隐去>");
+                    i += 3 + digits.len() + 1 + secret.len();
+                    continue;
+                }
+            }
+        }
+        // 按**字符**推进，绝不在多字节边界上切片
+        let ch = text[i..].chars().next().unwrap_or('?');
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -352,6 +432,13 @@ pub struct TgState {
     proxy: String,
     /// 已 emit 但还没等到前端回执的消息：chat_id → update_id
     pending: HashMap<i64, i64>,
+    /// 本机显示的一次性配对码。`None` = 不需要配对（已经绑定过会话了）。
+    ///
+    /// 安全审查 S3 的修复核心就在这里：原来"没有绑定任何会话时，
+    /// 第一个私聊 bot 的陌生人会被自动绑定"，而绑定之后一条
+    /// 「文件: …」就能走到执行命令那条链路。现在必须先拿到
+    /// **只显示在主人电脑屏幕上**的这个码。
+    pairing: Option<crate::agent_guard::Pairing>,
 }
 
 pub struct TgHandle(pub Mutex<TgState>);
@@ -420,6 +507,12 @@ pub fn spawn(app: &AppHandle) {
         store.offset
     ));
 
+    // 一个会话都没绑定时，起手就把配对码准备好 —— 否则主人配完 token
+    // 发第一条消息时只会看到"还没绑定"，还得回设置里点一下「生成配对码」。
+    // （安全审查 S3 之后，绑定必须带这个码；把码提前摆在屏幕上，
+    // 主人那边的体验和从前几乎一样，陌生人那边却绑不上了。）
+    let pairing = (bound == 0).then(crate::agent_guard::Pairing::generate);
+
     app.manage(TgHandle(Mutex::new(TgState {
         store,
         client,
@@ -429,10 +522,28 @@ pub fn spawn(app: &AppHandle) {
         last_poll: 0,
         proxy: proxy_desc(),
         pending: HashMap::new(),
+        pairing,
     })));
 
     let handle = app.clone();
     tauri::async_runtime::spawn(async move { run_loop(handle).await });
+
+    // 配对码过期就自动换一个：主人可能过半小时才想起来去配，
+    // 那时看到的是一个早就过期的码，发了没反应又不知道原因。
+    let refresher = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let needs_new = with_state(&refresher, |st| {
+                st.store.chats.is_empty()
+                    && st.pairing.as_ref().map(|p| p.remaining_secs() < 30).unwrap_or(true)
+            })
+            .unwrap_or(false);
+            if needs_new {
+                new_pairing(&refresher);
+            }
+        }
+    });
 }
 
 /// 短锁读取状态，避免在 await 期间持锁
@@ -565,8 +676,19 @@ async fn run_loop(app: AppHandle) {
                 log_line("检测到 Token 已更改：切换到新 Bot（无需重启）");
             }
             current = token.clone();
-            // 换过 bot 的话 load() 已把 offset 归零，这里把结果落盘
-            Store::load().save();
+            // **必须把内存里的 store 一起换掉，不能只调 save()**（审查报告 B4）。
+            //
+            // `Store::load()` 会按新 token 把 offset 归零（见 `sync_bot`），
+            // 但原来这里只有 `Store::load().save()` —— 那个 store 是个临时值，
+            // 落盘之后就被丢掉了；内存里 `st.store` 还是**旧 bot 的那一份**。
+            // 下一轮 `with_state(|st| st.store.offset)` 读到的仍是大 offset，
+            // 等于告诉新 bot「你之前那些消息我都不要了」——新 bot 的消息
+            // **一条都收不到**，而且要重启桌宠才好。更隐蔽的是：
+            // 这期间任何一次保存都会把旧的 bot_id 写回磁盘。
+            with_state(&app, |st| {
+                st.store = Store::load();
+                st.store.save();
+            });
             setup_bot(&client, &app, &token).await;
             with_state(&app, |st| st.running = true);
         }
@@ -660,18 +782,23 @@ async fn handle_update(
     // 这条消息是不是"手机发来的附件"（决定前端要不要强制走文件模式）
     let mut is_attachment = false;
 
-    let (is_bound, none_bound) = with_state(app, |st| {
+    let (is_bound, has_token) = with_state(app, |st| {
         (
             st.store.chats.iter().any(|c| c.chat_id == chat_id),
-            st.store.chats.is_empty(),
+            !token.trim().is_empty(),
         )
     })
     .unwrap_or((false, false));
 
     // ─── 命令 ───
-    // 白名单模型：未绑定的陌生会话除 /id 外一律不理。
-    // （正在认领「首个会话」时 none_bound 为真，此时允许回复 /start /help）
-    let allowed = is_bound || none_bound;
+    // 白名单模型：**未绑定的会话除了 /id /start /help /bind 之外一律不理**。
+    //
+    // 安全审查 S3：以前这里有一句 `none_bound`（"一个会话都没绑定"）时
+    // 自动认领第一个来消息的会话。触发时机相当常见 —— 配好 token 还没发
+    // 第一条消息、主人发了 /unbind、或者换了 bot token —— 于是**抢先**私聊
+    // 的陌生人就成了"主人"，紧接着发一条「文件: …」就能一路走到执行命令。
+    //
+    // 现在这条捷径没有了：必须带着只显示在主人电脑屏幕上的配对码来。
     if text.starts_with('/') {
         let cmd = text
             .split_whitespace()
@@ -683,6 +810,7 @@ async fn handle_update(
             .to_lowercase();
         match cmd.as_str() {
             "/id" => {
+                // /id 对谁都能用：主人正是靠它拿到 chat_id 来排查问题的
                 reply(
                     client,
                     token,
@@ -692,20 +820,56 @@ async fn handle_update(
                 .await;
                 return;
             }
-            "/start" | "/help" => {
-                if !allowed {
-                    log_line(&format!("忽略未绑定会话的命令: {} chat_id={}", cmd, chat_id));
+            "/bind" | "/start" | "/help" => {
+                if is_bound {
+                    // 已经绑定过的会话：/start /help 就是那份使用说明
+                    reply_kb(client, token, chat_id, HELP_TEXT).await;
                     return;
                 }
-                if !is_bound {
-                    bind_chat(app, chat_id, &title, &from);
+                // 未绑定：走配对码
+                let code = crate::agent_guard::extract_pairing_code(&text);
+                match try_pair(app, code.as_deref()) {
+                    PairOutcome::Bound => {
+                        bind_chat(app, chat_id, &title, &from);
+                        log_line(&format!(
+                            "🔗 配对成功，已绑定 chat_id={} ({})",
+                            chat_id, title
+                        ));
+                        reply_kb(
+                            client,
+                            token,
+                            chat_id,
+                            &format!(
+                                "✅ 配对成功，藿藿已经和这个会话绑定了（chat_id {}）。\n\
+                                 之后只有这个会话能跟她说话，别人发消息会被忽略。\n\
+                                 配对码已经作废，不用再管它。\n\n{}",
+                                chat_id, HELP_TEXT
+                            ),
+                        )
+                        .await;
+                    }
+                    other => {
+                        log_line(&format!(
+                            "配对未通过（{:?}）chat_id={} title={}",
+                            other, chat_id, title
+                        ));
+                        reply(
+                            client,
+                            token,
+                            chat_id,
+                            &format!(
+                                "🔐 配对码不对，或者这一代已经过期作废了。\n\n{}",
+                                pair_hint(chat_id, has_token)
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
                 }
-                // 顺带把模式键盘摆出来，省得用户去记命令
-                reply_kb(client, token, chat_id, HELP_TEXT).await;
                 return;
             }
             "/mode" => {
-                if !allowed {
+                if !is_bound {
                     return;
                 }
                 reply_kb(
@@ -718,7 +882,7 @@ async fn handle_update(
                 return;
             }
             "/chat" | "/qa" | "/file" => {
-                if !allowed {
+                if !is_bound {
                     return;
                 }
                 // 改写成前端认识的口令后**继续往下走**，交给同一条管线处理：
@@ -789,25 +953,57 @@ async fn handle_update(
     }
 
     // ─── 绑定 ───
+    //
+    // 安全审查 S3 修复后的规则：**没有配对码就绑不上**。
+    // 未绑定的会话只回一次配对指引（而不是静默丢弃 —— "静默"在这个项目里
+    // 一律当 bug 处理：主人自己换手机时会完全不知道该怎么办）。
     if !is_bound {
-        if none_bound {
-            bind_chat(app, chat_id, &title, &from);
-            reply(
-                client,
-                token,
-                chat_id,
-                &format!(
-                    "✅ 已把藿藿绑定到这个会话（chat_id {}）。\n之后只有这个会话能跟她说话，别人发消息会被忽略。\n\n{}",
-                    chat_id, HELP_TEXT
-                ),
-            )
-            .await;        } else {
+        // 用户可能直接发一串数字（最自然的动作），所以这里也认一次配对码
+        let code = crate::agent_guard::extract_pairing_code(&text);
+        if let Some(c) = code {
+            match try_pair(app, Some(&c)) {
+                PairOutcome::Bound => {
+                    bind_chat(app, chat_id, &title, &from);
+                    log_line(&format!("🔗 配对成功，已绑定 chat_id={} ({})", chat_id, title));
+                    reply_kb(
+                        client,
+                        token,
+                        chat_id,
+                        &format!(
+                            "✅ 配对成功，藿藿已经和这个会话绑定了（chat_id {}）。\n\
+                             之后只有这个会话能跟她说话。\n\n{}",
+                            chat_id, HELP_TEXT
+                        ),
+                    )
+                    .await;
+                    // 绑定成功后**继续往下走**，把这条消息也当成正常输入处理，
+                    // 免得主人发完码还要再说一遍想干什么。
+                }
+                other => {
+                    log_line(&format!(
+                        "配对未通过（{:?}）chat_id={} title={}",
+                        other, chat_id, title
+                    ));
+                    reply(
+                        client,
+                        token,
+                        chat_id,
+                        "🔐 配对码不对或者已经过期了。\n\
+                         请在电脑上打开桌宠 → ⚙️ 设置 → 「📱 Telegram」看一眼当前的配对码\
+                         （也可以点聊天面板标题栏的 📱 按钮），再发一次那 6 位数字。",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
             log_line(&format!(
                 "忽略未绑定会话的消息: chat_id={} title={}",
                 chat_id, title
             ));
+            reply(client, token, chat_id, &pair_hint(chat_id, has_token)).await;
+            return;
         }
-        return;
     }
 
     if text.is_empty() {
@@ -901,8 +1097,115 @@ fn spawn_ack_watchdog(
     });
 }
 
+/// 配对尝试的结果（只用于日志和回复措辞）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairOutcome {
+    Bound,
+    Wrong,
+    Missing,
+    Expired,
+    TooManyAttempts,
+    /// 已经绑定过会话了，不需要再配对
+    AlreadyPaired,
+}
+
+/// 核对配对码。**只有 Ok 才会返回 `Bound`** —— 其余一律不绑定。
+///
+/// 配对码是**一次性**的：一旦用掉就立刻销毁，同一串数字不能绑第二个会话。
+///
+/// 逻辑抽成"吃 `&mut TgState`"的纯函数（[`verify_pairing`]）：
+/// 这条路径是安全审查 S3 的修复本体，"绑定成功"的判据必须能被单测钉住，
+/// 而不是靠读代码推理。
+fn try_pair(app: &AppHandle, code: Option<&str>) -> PairOutcome {
+    with_state(app, |st| verify_pairing(st, code)).unwrap_or(PairOutcome::Missing)
+}
+
+/// [`try_pair`] 的本体：不碰 AppHandle，因此可以直接单测。
+fn verify_pairing(st: &mut TgState, code: Option<&str>) -> PairOutcome {
+    let Some(code) = code else {
+        return PairOutcome::Missing;
+    };
+    if !st.store.chats.is_empty() {
+        return PairOutcome::AlreadyPaired;
+    }
+    // 没有码（还没生成 / 已经被用掉 / 错太多次作废了）时**绝不能放行**：
+    // 这里必须显式判定，而不是靠 Option 的默认值。
+    let Some(p) = st.pairing.as_mut() else {
+        return PairOutcome::Expired;
+    };
+    match p.verify(code) {
+        crate::agent_guard::PairingCheck::Ok => {
+            st.pairing = None; // 一次性：用掉即销毁
+            PairOutcome::Bound
+        }
+        crate::agent_guard::PairingCheck::Wrong => PairOutcome::Wrong,
+        crate::agent_guard::PairingCheck::Missing => PairOutcome::Missing,
+        crate::agent_guard::PairingCheck::Expired => {
+            st.pairing = None; // 过期的码直接清掉
+            PairOutcome::Expired
+        }
+        crate::agent_guard::PairingCheck::TooManyAttempts => {
+            st.pairing = None; // 错太多次：作废，回电脑上重新生成
+            PairOutcome::TooManyAttempts
+        }
+    }
+}
+
+/// 配对码的当前状态（给设置面板和 📱 悬浮提示用）。
+///
+/// 抽成"吃 `&TgState`"的纯函数而不是自己 `with_state`：`telegram_status`
+/// 已经在持锁状态下拼返回值了，再套一层 `with_state` 就是**同一把锁重入**
+/// （`std::sync::Mutex` 不可重入，会当场死锁，表现是状态面板永久转圈）。
+pub(crate) fn pairing_json_locked(st: &TgState) -> serde_json::Value {
+    // 已经绑定过会话就不需要配对了 —— 面板上不显示码，
+    // 免得主人以为"还要再配一次"
+    if !st.store.chats.is_empty() {
+        return json!({ "needed": false, "code": "", "remaining_secs": 0 });
+    }
+    match st.pairing.as_ref() {
+        Some(p) if !p.is_expired() => json!({
+            "needed": true,
+            "code": p.code(),
+            "remaining_secs": p.remaining_secs(),
+        }),
+        _ => json!({ "needed": true, "code": "", "remaining_secs": 0 }),
+    }
+}
+
+pub(crate) fn pairing_json(app: &AppHandle) -> serde_json::Value {
+    with_state(app, |st| pairing_json_locked(st))
+        .unwrap_or_else(|| json!({ "needed": true, "code": "", "remaining_secs": 0 }))
+}
+
+/// 生成一个新的配对码（面板上的「生成配对码」按钮，以及启动时自动调一次）
+pub(crate) fn new_pairing(app: &AppHandle) -> serde_json::Value {
+    let p = crate::agent_guard::Pairing::generate();
+    let code = p.code().to_string();
+    let secs = p.remaining_secs();
+    with_state(app, |st| {
+        st.pairing = Some(p);
+    });
+    log_line(&format!(
+        "🔐 已生成配对码 {}（约 {} 分钟内有效，只显示在本机）",
+        code,
+        secs / 60
+    ));
+    json!({ "needed": true, "code": code, "remaining_secs": secs })
+}
+
+/// 前端问「现在要配对吗、码是多少」
+#[tauri::command]
+pub fn telegram_pairing(app: AppHandle) -> serde_json::Value {
+    pairing_json(&app)
+}
+
+/// 前端点「生成新配对码」
+#[tauri::command]
+pub fn telegram_new_pairing(app: AppHandle) -> serde_json::Value {
+    new_pairing(&app)
+}
+
 fn bind_chat(app: &AppHandle, chat_id: i64, title: &str, from: &str) {
-    let title = if title.is_empty() { from } else { title };
     with_state(app, |st| {
         if !st.store.chats.iter().any(|c| c.chat_id == chat_id) {
             st.store.chats.push(TgChat {
@@ -1295,18 +1598,28 @@ fn pick_boundary(bytes: &[u8]) -> String {
     format!("{}-fallback", BASE)
 }
 
-/// 按字符数切分（按字符而非字节，避免切断多字节汉字）
+/// 按字符切分，但计数用 **UTF-16 码元**（审查报告 B29）。
+///
+/// Telegram 的长度上限（4096）是按 **UTF-16 码元**算的，不是按 Unicode 字符：
+/// 一个非 BMP 字符（emoji、生僻字）占 **2** 个码元。原来是每个字符记 1，
+/// 于是一段塞满 emoji 的长回复 —— 3500 个字符实际是 7000 个码元 ——
+/// 会被接口以「message is too long」**整段拒掉**，那一段内容就永久丢了
+/// （分段发送是逐段发的，被拒的那段没有补发）。按码元计数则两种口径都安全：
+/// 普通汉字 1 个码元，和字符数完全一致。
 fn split_chunks(text: &str, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut n = 0usize;
     for ch in text.chars() {
-        cur.push(ch);
-        n += 1;
-        if n >= max {
+        let w = ch.len_utf16();
+        // **先判再加**：一个 emoji 占 2 个码元，`9 + 2 = 11` 会直接越过上限
+        // ——先加再判的话每段都能超出去一个码元，正好又踩回 B29 那个坑。
+        if n + w > max && n > 0 {
             out.push(std::mem::take(&mut cur));
             n = 0;
         }
+        cur.push(ch);
+        n += w;
     }
     if !cur.is_empty() {
         out.push(cur);
@@ -1396,7 +1709,27 @@ fn safe_file_name(raw: &str) -> String {
     if cleaned.is_empty() {
         return "file".to_string();
     }
-    cleaned.chars().take(120).collect()
+
+    // 截断时**保住扩展名**（审查报告 B28）。
+    //
+    // 原来直接 `take(120)`：手机发来的长文件名会把扩展名一起截掉，
+    // 落盘的文件没有后缀 —— `read_file` 之后不知道它是图片还是文档
+    // （抽正文那套逻辑按扩展名分派），主人自己也看不出这是什么文件。
+    // 现在只截主名，扩展名原样留在末尾。
+    const MAX_NAME_CHARS: usize = 120;
+    /// 超过这个长度的"后缀"不当扩展名看（免得整段文件名都被当成后缀保留）
+    const MAX_EXT_CHARS: usize = 10;
+    if cleaned.chars().count() <= MAX_NAME_CHARS {
+        return cleaned;
+    }
+    let (stem, ext) = match cleaned.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && e.chars().count() <= MAX_EXT_CHARS => {
+            (s.to_string(), format!(".{e}"))
+        }
+        _ => (cleaned.clone(), String::new()),
+    };
+    let keep = MAX_NAME_CHARS.saturating_sub(ext.chars().count());
+    format!("{}{}", stem.chars().take(keep).collect::<String>(), ext)
 }
 
 /// 同名不覆盖：依次尝试 `名字-1.ext`、`名字-2.ext`…
@@ -1635,6 +1968,9 @@ pub fn telegram_status(app: AppHandle) -> serde_json::Value {
             "last_poll": st.last_poll,
             "last_error": st.last_error,
             "log": log_path().to_string_lossy().to_string(),
+            // 配对码（只有"还没绑定任何会话"时才有值）——
+            // 它就是 S3 修复后主人的入口，必须让面板拿得到
+            "pairing": pairing_json_locked(st),
         })
     })
     .unwrap_or(fallback)
@@ -1656,6 +1992,142 @@ pub fn telegram_unbind(app: AppHandle, chat_id: i64) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── 安全审查 S3：配对绑定 ───
+    //
+    // 这四条钉住的是"陌生人绑不上"这件事本身。审查报告的原话是
+    // 「没有绑定任何会话时，第一个给 bot 私聊的陌生人会被自动绑定」，
+    // 而绑定之后一条「文件: …」就能走到执行命令。以下每一条都对应当初
+    // 那个 bug 的一种走法。
+
+    /// 造一个只有配对码、没有任何绑定的 TgState。
+    /// 用 `reqwest::Client::builder().build()` 而不是真去连网 —— 这些测试
+    /// 一个字节的网络都不该产生。
+    fn fresh_state(with_code: bool) -> TgState {
+        TgState {
+            store: Store::default(),
+            client: reqwest::Client::builder().build().unwrap(),
+            running: false,
+            bot_name: String::new(),
+            last_error: String::new(),
+            last_poll: 0,
+            proxy: String::new(),
+            pending: HashMap::new(),
+            pairing: with_code.then(crate::agent_guard::Pairing::generate),
+        }
+    }
+
+    /// **核心断言**：没有任何配对码时，谁也别想绑上。
+    /// 这正是"陌生人在主人配好 token 之前抢先发消息"那条路。
+    #[test]
+    fn s3_without_a_pairing_code_nobody_can_bind() {
+        let mut st = fresh_state(false);
+        // 陌生人发来的任何东西都不能绑上。
+        // （`Some("")` 在真实路径上不会出现 —— `extract_pairing_code`
+        // 只返回长度正好 6 的纯数字串；这里连这种情况一起钉住。）
+        assert_eq!(verify_pairing(&mut st, None), PairOutcome::Missing);
+        assert_eq!(verify_pairing(&mut st, Some("")), PairOutcome::Expired);
+        // 发了一串数字但这台机器**根本没有码**（还没生成 / 已经用掉）：
+        // 一律当"过期作废"，绝不能因为"没有码"就当成"没设防"
+        assert_eq!(verify_pairing(&mut st, Some("123456")), PairOutcome::Expired);
+        assert!(st.store.chats.is_empty(), "一次都不许绑上");
+        assert!(st.pairing.is_none());
+    }
+
+    /// 猜错的码绑不上，而且错满 5 次后连正确的码也一起作废
+    /// （否则攻击者可以慢慢试到主人自己来配为止）。
+    #[test]
+    fn s3_guessing_is_capped() {
+        let mut st = fresh_state(true);
+        let right = st.pairing.as_ref().unwrap().code().to_string();
+        let wrong = if right == "000000" { "111111" } else { "000000" };
+
+        assert_eq!(verify_pairing(&mut st, Some(wrong)), PairOutcome::Wrong);
+        assert!(st.store.chats.is_empty(), "猜错绝不能绑上");
+
+        for _ in 0..4 {
+            verify_pairing(&mut st, Some(wrong));
+        }
+        assert!(st.pairing.is_none(), "错满次数后码要作废");
+        assert_eq!(verify_pairing(&mut st, Some(&right)), PairOutcome::Expired);
+        assert!(st.store.chats.is_empty());
+    }
+
+    /// 正确的码能绑上，而且**用掉即作废**（同一串数字不能绑第二个会话）
+    #[test]
+    fn s3_correct_code_binds_once() {
+        let mut st = fresh_state(true);
+        let right = st.pairing.as_ref().unwrap().code().to_string();
+        assert_eq!(verify_pairing(&mut st, Some(&right)), PairOutcome::Bound);
+        assert!(st.pairing.is_none(), "一次性：用掉就要销毁");
+
+        // 第二个会话拿同一串数字再来：不行
+        assert_eq!(verify_pairing(&mut st, Some(&right)), PairOutcome::Expired);
+    }
+
+    /// 已经绑定过会话时不再接受配对（码根本不该存在，但要防住状态错乱）
+    #[test]
+    fn s3_bound_state_ignores_pairing() {
+        let mut st = fresh_state(true);
+        let right = st.pairing.as_ref().unwrap().code().to_string();
+        st.store.chats.push(TgChat {
+            chat_id: 1,
+            title: "主人".to_string(),
+            username: String::new(),
+            bound_at: 0,
+        });
+        assert_eq!(verify_pairing(&mut st, Some(&right)), PairOutcome::AlreadyPaired);
+        assert_eq!(st.store.chats.len(), 1, "不能因此多出一个会话");
+    }
+
+    /// 配对码状态：绑定之前要有码给主人看，绑定之后就不再显示了
+    #[test]
+    fn s3_pairing_json_hides_code_after_binding() {
+        let mut st = fresh_state(true);
+        let j = pairing_json_locked(&st);
+        assert_eq!(j["needed"], true);
+        assert_eq!(j["code"].as_str().unwrap().len(), 6);
+
+        st.store.chats.push(TgChat {
+            chat_id: 1,
+            title: String::new(),
+            username: String::new(),
+            bound_at: 0,
+        });
+        let j2 = pairing_json_locked(&st);
+        assert_eq!(j2["needed"], false, "绑定之后不该再显示配对码");
+        assert_eq!(j2["code"], "");
+    }
+
+    /// 没有码时状态必须是"要配对，但码为空"，而不是漏掉字段 ——
+    /// 前端靠 `needed` 决定要不要把那一栏画出来。
+    #[test]
+    fn s3_pairing_json_without_code_is_explicit() {
+        let st = fresh_state(false);
+        let j = pairing_json_locked(&st);
+        assert_eq!(j["needed"], true);
+        assert_eq!(j["code"], "");
+        assert_eq!(j["remaining_secs"], 0);
+    }
+
+    /// 配对说明必须指向**该做的那件事**，而且不能在"没配 token"时说"去看码"
+    /// （那时候根本没有码，用户会白找一圈）。
+    #[test]
+    fn s3_pair_hint_points_at_the_code() {
+        let with_token = pair_hint(123, true);
+        assert!(with_token.contains("设置"), "要说去哪儿看: {with_token}");
+        assert!(with_token.contains("配对码"), "{with_token}");
+        assert!(with_token.contains("123"), "要带上他自己的 chat_id");
+        assert!(with_token.contains("/unbind") || with_token.contains("作废"), "要说明码是一次性的");
+
+        let no_token = pair_hint(123, false);
+        assert!(no_token.contains("Token"), "没配 token 时要先说这件事: {no_token}");
+
+        // /help 那份说明也要跟得上新规则：旧文案写的是"解绑后重新发消息绑定"
+        assert!(HELP_TEXT.contains("配对"), "使用说明里必须提到配对");
+        assert!(!HELP_TEXT.contains("重新发消息绑定"), "旧文案（谁发消息谁绑）必须删掉");
+        assert!(HELP_TEXT.contains("手机远程控制"), "要让主人知道放权开关在哪");
+    }
 
     /// 造一条带 source 链的错误，模拟 reqwest 的报错形状
     #[derive(Debug)]
@@ -1738,6 +2210,96 @@ mod tests {
     #[test]
     fn split_chunks_empty_input_still_yields_one() {
         assert_eq!(split_chunks("", 10), vec![String::new()]);
+    }
+
+    /// 审查报告 B29：分段要按 **UTF-16 码元**计数，不是按 Unicode 字符。
+    ///
+    /// Telegram 的上限是 4096 码元，一个 emoji 占 2 个。按字符计数的话，
+    /// 一段塞满 emoji 的长回复会被接口整段拒掉 —— 那一段内容永久丢失。
+    #[test]
+    fn b29_split_counts_utf16_units() {
+        // 每个 emoji 占 2 个码元：上限 10 → 每段最多 5 个
+        let emoji = "😅".repeat(30);
+        assert_eq!(emoji.chars().count(), 30);
+        assert_eq!(emoji.encode_utf16().count(), 60);
+
+        let chunks = split_chunks(&emoji, 10);
+        for c in &chunks {
+            assert!(
+                c.encode_utf16().count() <= 10,
+                "每段的 UTF-16 码元数必须在上限内，实际 {}",
+                c.encode_utf16().count()
+            );
+        }
+        // 一个字符都不能丢，也不能在字符中间断开（断在代理对中间会解出 �）
+        assert_eq!(chunks.concat(), emoji);
+
+        // 普通汉字：1 个字符 = 1 个码元，行为和原来一致
+        let han = "藿".repeat(25);
+        let chunks = split_chunks(&han, 10);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.concat(), han);
+
+        // 混合：汉字 + emoji 一起，仍然不超、不丢
+        let mixed = format!("{}{}", "藿".repeat(7), "😅".repeat(7));
+        let chunks = split_chunks(&mixed, 10);
+        assert_eq!(chunks.concat(), mixed);
+        for c in &chunks {
+            assert!(c.encode_utf16().count() <= 10);
+        }
+    }
+
+    /// 审查报告 B28：长文件名截断时必须**保住扩展名**。
+    ///
+    /// 否则落盘的文件没有后缀，`read_file` 那套按扩展名分派的逻辑
+    /// （抽 docx/pdf 正文等）就认不出它是什么，主人自己也看不出。
+    #[test]
+    fn b28_long_file_name_keeps_extension() {
+        let long = format!("{}.docx", "很长的文件名".repeat(40)); // 240 字 + 后缀
+        let safe = safe_file_name(&long);
+        assert!(safe.chars().count() <= 120, "总长度仍要有上限");
+        assert!(safe.ends_with(".docx"), "扩展名必须保住: {safe}");
+
+        // 没有扩展名时就是直接截断
+        let no_ext = safe_file_name(&"a".repeat(300));
+        assert_eq!(no_ext.chars().count(), 120);
+
+        // 正常的短名字一个字节都不动
+        assert_eq!(safe_file_name("报告.docx"), "报告.docx");
+        // 防穿越那一层不能被破坏
+        assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("C:\\Windows\\x.txt"), "x.txt");
+    }
+
+    /// 审查报告 S7：Bot Token 会跟着 reqwest 的错误 URL 一起进日志 ——
+    /// 而 README 还让用户"贴日志来排错"。所有要落日志/发出的错误都必须先抹掉它。
+    #[test]
+    fn s7_bot_token_is_redacted_from_errors() {
+        let token = "1234567890:AAFakeTokenForTestOnly_abcdefghijklmn";
+        let url = format!("https://api.telegram.org/bot{token}/getUpdates");
+        let text = format!("error sending request for url ({url}) <- connection closed");
+
+        let safe = redact_token(&text);
+        assert!(!safe.contains(token), "token 必须被抹掉: {safe}");
+        assert!(!safe.contains("AAFakeTokenForTestOnly"), "连密钥片段都不能留");
+        assert!(safe.contains("bot<已隐去>"), "要留一句可读的痕迹: {safe}");
+        assert!(safe.contains("api.telegram.org"), "域名留着，排错还需要它");
+        assert!(safe.contains("connection closed"), "真正的原因不能被吃掉");
+
+        // 不是 token 的文本一律原样（尤其别把中文切出毛病）
+        for keep in [
+            "普通的一句话，没有任何 token",
+            "bot 后面没数字",
+            "bot123 没有冒号",
+            "机器人 1234567890:短",
+        ] {
+            assert_eq!(redact_token(keep), keep, "不该改动: {keep}");
+        }
+        // 多个 token 也要全抹掉
+        let two = format!("bot{token}/x bot{token}/y");
+        let safe = redact_token(&two);
+        assert!(!safe.contains(token));
+        assert_eq!(safe.matches("bot<已隐去>").count(), 2);
     }
 
     /// 键盘按钮文案必须能被前端的模式口令认出来。

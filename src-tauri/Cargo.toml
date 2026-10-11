@@ -32,6 +32,11 @@ reqwest = { version = "0.12", features = ["json"] }
 # 原来的 "full" 会额外拉进 fs/process/signal/net/io-util/macros/sync 等一整套 crate。
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 base64 = "0.22"
+# 网页字符集解码（安全审查 B31）：不少国内站点只在 HTML 里写
+# `<meta charset="gb2312">`，响应头里什么都没有，按 UTF-8 解就是满屏乱码。
+# 它本来就已经在依赖树里（reqwest 的 `text()` 用的就是它），显式声明只是
+# 为了能直接调用，不会多拉任何代码。
+encoding_rs = "0.8"
 ring = "0.17"
 flate2 = "1"
 rodio = "0.20"
@@ -43,7 +48,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 [target.'cfg(windows)'.dependencies]
 # Win32_System_Diagnostics_Debug 只为了 SetErrorMode：关掉系统级的硬错误**模态框**。
 # 不关的话 spawn 一个非法 exe 会弹模态框并卡住调用线程（更新界面会永远停在"正在安装"）。
-windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Diagnostics_Debug"] }
+# Win32_UI_Shell 是为了 SHGetKnownFolderPath（审查报告 B2/B19：桌面/下载/文档的
+# 真实路径——中文 Windows 上目录名是英文的，开了 OneDrive 备份后又搬到 OneDrive 下，
+# 靠 `%USERPROFILE%\Desktop` 拼路径会猜错）；它返回的字符串要用
+# Win32_System_Com 的 CoTaskMemFree 释放，所以这两个特性要一起开。
+windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Diagnostics_Debug", "Win32_UI_Shell", "Win32_System_Com"] }
 
 # ─────────────────── 构建产物瘦身 ───────────────────
 # 背景：Tauri + 551 个依赖，默认配置会在 target/ 下堆积约 17 GB 中间产物

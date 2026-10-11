@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, nextTick, computed } from 'vue'
+import { onMounted, onUnmounted, ref, nextTick, computed, watch } from 'vue'
 import * as PIXI from 'pixi.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -323,6 +323,17 @@ const settings = ref({
   /** 主人自定义的性格（空 = 内置人设） */
   persona: '',
   persona_max: 1000,
+  /**
+   * 手机 Telegram 的**远程控制开关**（安全审查 S1/S2 的修复）。
+   *
+   * 三个都默认 false：手机随时可以读文件、问天气（这是这条通道的本职工作），
+   * 但写文件 / 发文件 / 执行命令默认全部拒绝。要开，必须由主人
+   * **在这台电脑上**手动勾选 —— 攻击者能往 bot 发消息，却改不了这个设置文件
+   * （`%APPDATA%\desktop-pet` 已被后端拉黑）。
+   */
+  tg_allow_command: false,
+  tg_allow_write: false,
+  tg_allow_send: false,
 })
 
 /** 文件模式正在做什么（"正在读取 简历.docx"））
@@ -353,7 +364,7 @@ async function clearProjectMemory() {
     settingsMsg.value = '✅ 项目记忆已清空，她会从这个项目从零开始'
     setTimeout(() => { if (settingsMsg.value.startsWith('✅ 项目记忆')) settingsMsg.value = '' }, 2500)
   } catch (e) {
-    settingsMsg.value = `❌ 清空失败：{String(e).slice(0, 120)}`
+    settingsMsg.value = `❌ 清空失败：${String(e).slice(0, 120)}`
   }
 }
 
@@ -503,21 +514,35 @@ function createPanelDrag(cfg: {
       position()
     }
 
-    const finish = (ev: PointerEvent) => {
+    let finished = false
+    const finish = (ev?: PointerEvent) => {
+      if (finished) return          // lostpointercapture 会在 releasePointerCapture 里再触发一次
+      finished = true
       panelDragging = false
-      try { handle.releasePointerCapture(ev.pointerId) } catch { /* 本来就没捕获到 */ }
+      try { if (ev) handle.releasePointerCapture(ev.pointerId) } catch { /* 本来就没捕获到 */ }
       // 挂在 window 上（而不是标题栏）：标题栏只有二三十像素高，
       // 捕获一旦没拿到，指针往上一移就出了它的范围，拖动会当场断掉
       window.removeEventListener('pointermove', onMove, true)
       window.removeEventListener('pointerup', finish, true)
       window.removeEventListener('pointercancel', finish, true)
+      handle.removeEventListener('lostpointercapture', onLostCapture)
+      window.removeEventListener('blur', onWindowBlur)
       if (moved >= 3) save()
       updateWindowRegion() // 恢复裁剪
     }
 
+    // 拖动中窗口失焦（点了别的程序 / 切走了）时 pointerup 根本不会送到这个窗口，
+    // 于是 panelDragging 一直是 true —— 而它会让窗口**不再裁剪点击区域**，
+    // 一块透明的全屏窗口就这样挡住整个桌面的点击（审查 F19）。
+    // 所以丢捕获和失焦都当成"拖动结束"。
+    const onLostCapture = () => finish()
+    const onWindowBlur = () => finish()
+
     window.addEventListener('pointermove', onMove, true)
     window.addEventListener('pointerup', finish, true)
     window.addEventListener('pointercancel', finish, true)
+    handle.addEventListener('lostpointercapture', onLostCapture)
+    window.addEventListener('blur', onWindowBlur)
   }
 
   /** 双击标题栏：忘掉拖动位置，回到跟随桌宠 */
@@ -649,10 +674,13 @@ function resetMemoryPos() { memoryDrag.reset() }
 let petScaleSaveTimer: ReturnType<typeof setTimeout> | null = null
 function persistPetScaleSoon() {
   if (petScaleSaveTimer) clearTimeout(petScaleSaveTimer)
+  // 把**此刻**的值闭包捕获下来：600ms 内用户完全可能点开设置面板，
+  // 而 loadSettings 会拿磁盘上的旧值把 settings.value.pet_scale 盖回去 ——
+  // 到那时再读，写回磁盘的就是旧值，滚轮调的大小白改了（审查 F9）。
+  const v = settings.value.pet_scale
+  if (!Number.isFinite(v)) return
   petScaleSaveTimer = setTimeout(() => {
     petScaleSaveTimer = null
-    const v = settings.value.pet_scale
-    if (!Number.isFinite(v)) return
     invoke('save_settings', { petScale: v })
       .then(() => {
         // 与基准同步：这样之后在设置面板里按保存，不会把同一个值又提交一遍
@@ -727,8 +755,26 @@ function openSettings() {
   })
 }
 
+/**
+ * 关掉设置面板。
+ *
+ * 必须在这里把「拖动大小滑块」的预览还原回基准值：滑块是**即时预览、保存才落盘**的，
+ * 用户拖完直接按 ✕ 时，桌宠会停在预览的那个大小，而滑块（下次打开读的是磁盘）
+ * 显示的是旧值 —— 两边对不上，用户只会以为"改了没生效"（审查 F10）。
+ */
+function closeSettings() {
+  showSettings.value = false
+  // 有还没落盘的滚轮缩放时**不要还原**：那个值 600ms 后会被写进磁盘
+  // （见 persistPetScaleSoon），这会儿还原只会让桌宠和磁盘又对不上。
+  const wheelScalePending = petScaleSaveTimer !== null
+  const base = Number(settingsBaseline.pet_scale)
+  if (!wheelScalePending && Number.isFinite(base) && settings.value.pet_scale !== base) {
+    applyPetScale(base)
+  }
+}
+
 function toggleSettings() {
-  if (showSettings.value) { showSettings.value = false } else { openSettings() }
+  if (showSettings.value) { closeSettings() } else { openSettings() }
   updateWindowRegion()
 }
 
@@ -779,6 +825,12 @@ async function saveSettings(): Promise<boolean> {
   diff('llm_base_url', 'llmBaseUrl')
   diff('llm_model', 'llmModel')
   diff('llm_api_key', 'llmApiKey')
+  // 清空密钥时要**连旧字段一起清**：后端取"生效密钥"是新字段优先、为空则回落到
+  // 旧的 `deepseek_api_key`（settings.rs 的 effective key）。老用户只把新字段清成空，
+  // 旧字段还在，密钥等于没清掉 —— 界面上显示"没配"，实际还在用（审查 F11）。
+  if (payload.llmApiKey === '' && settingsBaseline.llm_api_key !== '') {
+    payload.deepseekApiKey = ''
+  }
   diff('llm_use_proxy', 'llmUseProxy')
   diff('volc_app_id', 'volcAppId')
   diff('volc_access_token', 'volcAccessToken')
@@ -802,6 +854,11 @@ async function saveSettings(): Promise<boolean> {
   diff('qweather_project_id', 'qweatherProjectId')
   diff('qweather_credential_id', 'qweatherCredentialId')
   diff('persona', 'persona')
+  // 手机远程控制的三个开关（默认全关）。和其它字段同一个规矩：
+  // 没动过就不提交 —— 老版本前端不带这三个字段，后端必须保持原样。
+  diff('tg_allow_command', 'tgAllowCommand')
+  diff('tg_allow_write', 'tgAllowWrite')
+  diff('tg_allow_send', 'tgAllowSend')
   // 私钥种子只在"这次真的填了"时才提交：面板不回显它，
   // 若把它当成普通字段 diff，一次保存就会把磁盘上已有的种子写成空
   if (cur.qweather_key_seed !== '') payload.qweatherKeySeed = cur.qweather_key_seed
@@ -877,9 +934,13 @@ async function testLink(url: string) {
 async function testProgram(key: 'qq_path' | 'kugou_path') {
   settingsMsg.value = '⏳ 正在启动…'
   try {
+    // 把**框里的**路径传给后端：原来不带参数，后端只能去读磁盘上已保存的旧路径，
+    // 于是框里填错也照样显示 ✅（审查 F6）。后端 `open_qq` / `open_kugou_music`
+    // 现在都有 `path: Option<String>` 形参，给了就只认它、路径不存在会返回失败。
+    const path = String((settings.value as Record<string, any>)[key] || '')
     const msg = key === 'qq_path'
-      ? await invoke<string>('open_qq')
-      : await invoke<string>('open_kugou_music')
+      ? await invoke<string>('open_qq', { path })
+      : await invoke<string>('open_kugou_music', { path })
     settingsMsg.value = `✅ ${msg}`
   } catch (e) {
     settingsMsg.value = `❌ ${String(e).slice(0, 120)}`
@@ -1079,17 +1140,54 @@ function hotkeyMainKey(e: KeyboardEvent): string {
   return map[code] || ''
 }
 
-/** 录制：按住修饰键再按主键，写进对应的设置项 */
+/**
+ * 录制：按住修饰键再按主键，写进对应的设置项。
+ *
+ * **没有修饰键时绝不能录**：后端的 `is_plain_key` 只拦单个字母和数字，所以
+ * 退格 / Tab / 回车 / 空格 / 方向键都能注册成功 —— 而 `RegisterHotKey` 是
+ * **系统级**抢占，录了退格键之后整台电脑所有程序里都删不了字（审查 F1）。
+ * 这里定的规矩：无修饰键时退格 / Delete 当「清空」、Esc 当「取消」，
+ * 只有 F1–F24 允许单键（它们不参与日常输入，单独按不会误伤）。
+ *
+ * `preventDefault` 只在**真的要录**的那几次调用：早先无条件调用，
+ * 结果 Tab 也没法用来切到下一个输入框了。
+ */
 function captureHotkey(e: KeyboardEvent, field: string) {
-  e.preventDefault()
   hotkeyRecording.value = field
   const isModifierOnly = ['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)
   if (isModifierOnly) return            // 只按了修饰键：等他接着按主键
+  const hasModifier = e.ctrlKey || e.altKey || e.shiftKey || e.metaKey
+  const code = e.code || ''
+  const isFunctionKey = /^F([1-9]|1\d|2[0-4])$/.test(code)
+
+  if (!hasModifier && !isFunctionKey) {
+    // 退格 / Delete：用户想删掉这一项，当成「清空」而不是录成一个热键
+    if (code === 'Backspace' || code === 'Delete') {
+      e.preventDefault()
+      clearHotkey(field)
+      hotkeyRecording.value = ''
+      return
+    }
+    // Esc：算了不录了（也不拦默认行为，它本来就没别的用途）
+    if (e.key === 'Escape') {
+      hotkeyRecording.value = ''
+      hotkeyMsg.value = ''
+      return
+    }
+    // Tab 放行：还要能靠它切换到下一个输入框（这就是原来最碍事的那一条）
+    if (code === 'Tab') return
+    // 其余单键（回车 / 空格 / 方向键 / 字母数字…）一律拒掉，别去抢系统按键
+    hotkeyRecording.value = ''
+    hotkeyMsg.value = `❌ 「${e.key}」要配上 Ctrl / Alt / Shift / Win 才能当热键：单键会把整个系统的这个键抢走`
+    return
+  }
+
   const main = hotkeyMainKey(e)
   if (!main) {
     hotkeyMsg.value = `❌ 这个键（${e.key}）暂时不被支持，换一个试试`
     return
   }
+  e.preventDefault()
   const parts: string[] = []
   if (e.ctrlKey) parts.push('Ctrl')
   if (e.altKey) parts.push('Alt')
@@ -1307,14 +1405,28 @@ async function toggleAutostart(kind: 'pet' | 'watchdog') {
     const actual = await invoke<boolean>('set_autostart', { kind, enabled: want })
     settings.value[key] = actual
     settingsBaseline[key] = actual  // 后端已落盘，基准同步跟上
-    settingsMsg.value = actual
+    // 关掉也是**成功**：原来开/关共用一句带 ❌ 的文案，关闭时显示「❌ 已关闭」，
+    // 用户会以为操作失败了（审查 F20）
+    const msg = actual
       ? `✅ 已开启${kind === 'pet' ? '桌宠' : '看门狗'}开机自启`
-      : `❌ 已关闭${kind === 'pet' ? '桌宠' : '看门狗'}开机自启`
-    setTimeout(() => { settingsMsg.value = '' }, 2500)
+      : `✅ 已关闭${kind === 'pet' ? '桌宠' : '看门狗'}开机自启`
+    settingsMsg.value = msg
+    // 只清掉**自己**这一条：2.5 秒内用户可能又按了别的（比如「已保存」），
+    // 原来无条件清空会把那条也一起冲掉（审查 F20）
+    setTimeout(() => { if (settingsMsg.value === msg) settingsMsg.value = '' }, 2500)
   } catch (e) {
-    settingsMsg.value = `❌ 操作失败：{String(e).slice(0, 120)}`
-    // 失败时以后端真实状态为准
-    loadSettings()
+    // 注意 $ 不能漏：漏了界面上会原样显示 "{String(e).slice(0, 120)}"（审查 F4）
+    settingsMsg.value = `❌ 操作失败：${String(e).slice(0, 120)}`
+    // 失败时以后端真实状态为准 —— 但**只刷新这两个开关**（审查 D6）。
+    // 原来调的是整份 `loadSettings()`：它会用磁盘上的值把面板上
+    // **还没保存的其它修改**（改了一半的模型名、敲了一半的密钥…）一起冲掉。
+    try {
+      const snap = await invoke<Record<string, any>>('get_settings')
+      settings.value.autostart_pet = !!snap.autostart_pet
+      settings.value.autostart_watchdog = !!snap.autostart_watchdog
+      settingsBaseline.autostart_pet = !!snap.autostart_pet
+      settingsBaseline.autostart_watchdog = !!snap.autostart_watchdog
+    } catch {}
   } finally {
     settingsSaving.value = false
   }
@@ -1402,11 +1514,12 @@ const WEEKDAY_NAMES = ['星期日', '星期一', '星期二', '星期三', '星�
 
 function formatDateChinese(): string {
   const d = new Date()
-  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} $${WEEKDAY_NAMES[d.getDay()]}`
+  // 这里原来多写了一个 `$`，弹窗里显示成「2026-10-10 $星期六」（审查 F14）
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} ${WEEKDAY_NAMES[d.getDay()]}`
 }
 
-// 节日查找表（公历固定日期 + 农历节日公历近似日期 2026-2027）
-const HOLIDAYS: Record<string, string> = {
+/** 公历固定日期的节日：每年都是同一天，所以键只记「月-日」 */
+const FIXED_HOLIDAYS: Record<string, string> = {
   '1-1': '元旦 🎊',
   '2-14': '情人节💕',
   '3-8': '妇女节🌸',
@@ -1416,30 +1529,43 @@ const HOLIDAYS: Record<string, string> = {
   '10-1': '国庆节🇨🇳',
   '12-24': '平安夜🎄',
   '12-25': '圣诞节🎅',
-  // 2026 农历节日（公历对应日期）
-  '2-17': '春节 🧧',
-  '4-4': '清明节🌿',
-  '6-19': '端午节🎋',
-  '8-19': '七夕节💕',
-  '9-25': '中秋节🥮',
-  '10-18': '重阳节🌺',
-  '12-22': '冬至 ❄️',
-  // 2027 农历节日（公历对应日期）
-  '2-6': '春节 🧧',
-  '4-5': '清明节🌿',
-  '6-8': '端午节🎋',
-  '8-8': '七夕节💕',
-  '9-14': '中秋节🥮',
-  '10-7': '重阳节🌺',
 }
 
-function checkHoliday(month: number, day: number, weekday: number): string {
-  // 周末标记
+/**
+ * 农历节日的**公历对应日期**。
+ *
+ * 键必须带年份：这些节日每年落在不同的公历日期上，只记「月-日」的话
+ * 2027 年的春节（2-6）会显示在 2026-2-6 上、2026 年的春节（2-17）
+ * 又会显示在 2027-2-17 上（审查 F2）。这张表是逐年手工核对的，
+ * 所以**只有 2026 / 2027 两年**：宁可那之后不显示，也不能显示错的
+ * （要长期准确就得引入农历库，代价是往桌宠里塞一份几百 KB 的数据）。
+ */
+const LUNAR_HOLIDAYS: Record<string, string> = {
+  // 2026
+  '2026-2-17': '春节 🧧',
+  '2026-4-4': '清明节🌿',
+  '2026-6-19': '端午节🎋',
+  '2026-8-19': '七夕节💕',
+  '2026-9-25': '中秋节🥮',
+  '2026-10-18': '重阳节🌺',
+  '2026-12-22': '冬至 ❄️',
+  // 2027
+  '2027-2-6': '春节 🧧',
+  '2027-4-5': '清明节🌿',
+  '2027-6-8': '端午节🎋',
+  '2027-8-8': '七夕节💕',
+  '2027-9-14': '中秋节🥮',
+  '2027-10-7': '重阳节🌺',
+}
+
+function checkHoliday(year: number, month: number, day: number, weekday: number): string {
+  // **先查节日、再判周末**：节日落在周末是常事（2026-10-18 重阳就是周日、
+  // 2026-2-14 情人节是周六）。原来先 return 周末，节日表根本没被查过（审查 F2）。
+  const holiday = LUNAR_HOLIDAYS[`${year}-${month}-${day}`] || FIXED_HOLIDAYS[`${month}-${day}`]
+  if (holiday) return holiday
   if (weekday === 0) return '周末 ☀️'
   if (weekday === 6) return '周末 🌿'
-  // 节日查找
-  const key = `${month}-${day}`
-  return HOLIDAYS[key] || ''
+  return ''
 }
 
 // ─── 右键饼状菜单 ───
@@ -1678,19 +1804,60 @@ async function checkEmails() {
     if (key === lastEmailKey) return
     lastEmailKey = key
     emailRawData.value = JSON.stringify(emails, null, 2)
-    emailQueue = [...useful.slice(-3)]
+    // **追加 + 按 uid 去重，不能整体替换**（审查 D2）。
+    //
+    // 原来是 `emailQueue = [...useful.slice(-3)]`：一次来了 A、B、C 三封，
+    // 界面正在显示 A，还没双击看下一封，又来了 D —— 队列当场只剩 [D]，
+    // B 和 C **永远不会再显示**（后端那时还会把它们标成已读，下次 UNSEEN
+    // 也搜不回来了，两头一起丢）。
+    // 现在保留队列里还没看的，只把新 uid 追加到末尾，并按 uid 去重
+    // （后端每轮都会返回同一个未读集合，不去重会重复几十份）。
+    const known = new Set(emailQueue.map(e => e.uid))
+    for (const e of useful.slice(-3)) {
+      if (!known.has(e.uid)) {
+        known.add(e.uid)
+        emailQueue.push(e)
+      }
+    }
+    // 队列也不能无限长：这里只保底不让"没看完的"被挤掉，上限 20 封足够翻很久
+    if (emailQueue.length > 20) emailQueue = emailQueue.slice(emailQueue.length - 20)
     // 主动推送：新邮件同步到 Telegram
     pushEmailToTelegram(useful)
     // 不覆盖正在显示的邮件，等用户双击后再看下一封
-    if (!showEmailBubble.value) showNextEmail()
+    if (!showEmailBubble.value) {
+      // 聊天面板开着就**先不弹**：气泡正好压在输入框上，用户只能先双击关掉邮件
+      // 才能接着打字（审查 F7）。记下来，等聊天面板关了再弹（见下面的 watch）。
+      if (showChat.value) emailBubbleDeferred = true
+      else showNextEmail()
+    }
   } catch {}
 }
 
+/** 聊天面板开着时，邮件气泡被推迟到它关闭之后再弹（审查 F7） */
+let emailBubbleDeferred = false
+
+watch(showChat, (open) => {
+  if (open || !emailBubbleDeferred) return
+  emailBubbleDeferred = false
+  if (!showEmailBubble.value && emailQueue.length) showNextEmail()
+})
+
+/** 复制当前这封邮件的原始数据。**必须给成功/失败一个回音**（审查 D3）：
+ *  原来复制完什么都不显示，用户不确定成功了没有，就会再点一下 ——
+ *  正好构成双击，事件冒泡到气泡上的 @dblclick="showNextEmail()"，
+ *  这封邮件被写进"已关闭"列表，**以后再也不会显示**。 */
 async function copyEmailData() {
   try {
     await navigator.clipboard.writeText(emailRawData.value)
-  } catch {}
+    emailBubbleTip.value = '📋 已复制'
+  } catch (e) {
+    emailBubbleTip.value = `❌ 复制失败：${String(e).slice(0, 60)}`
+  }
+  setTimeout(() => { emailBubbleTip.value = '' }, 1500)
 }
+
+/** 复制按钮的即时回音（见 copyEmailData） */
+const emailBubbleTip = ref('')
 
 function refreshEmailBubbleStyle() {
   const s = bubbleStyle(-18)
@@ -1714,9 +1881,11 @@ async function clearChatInput() {
 async function sendMessage() {
   const msg = chatInput.value.trim()
   if (!msg || chatLoading.value) return
+  // **先把输入框清掉再发**（审查 D7）：原来等回复回来才清，
+  // 用户在这十几秒里打的下半句话会被一起抹掉。
+  await clearChatInput()
   // 排队执行：TG 消息可能正在处理中，共用同一套 UI/记忆状态，不能并发
   await enqueuePipeline(() => handleUserMessage(msg))
-  await clearChatInput()
 }
 
 /**
@@ -1728,8 +1897,18 @@ async function sendMessage() {
  *
  * `forceFileMode`：手机发来的附件走这一条时置真 —— 只对**这一条**用文件模式，
  * 不改变用户当前选的模式（和「文件： xxx」单次前缀同一个思路）。
+ *
+ * `toolSource`：这条请求是"谁"发起的 —— `'local'`（主人坐在电脑前）还是
+ * `'telegram'`（手机）。后端靠它决定手机来的写文件/执行命令要不要拒绝
+ * （安全审查 S1/S2/S3）。**默认 local**：本地输入框走的就是这条路，
+ * 而真·手机消息由 `handleTelegramMessage` 显式传 'telegram'，
+ * 不会因为漏传一个参数就把手机消息当成主人的本机操作。
  */
-async function handleUserMessage(msg: string, forceFileMode = false): Promise<string> {
+async function handleUserMessage(
+  msg: string,
+  forceFileMode = false,
+  toolSource: 'local' | 'telegram' = 'local',
+): Promise<string> {
   const text = msg.trim()
   if (!text) return ''
 
@@ -1760,7 +1939,9 @@ async function handleUserMessage(msg: string, forceFileMode = false): Promise<st
   // ─── 单次前缀指令：「问答： xxx」「文件： xxx」只用对应模式处理这一条，不改变当前模式 ───
   let effectiveMsg = text
   let effectiveMode: ChatModeId = forceFileMode ? 'file' : chatMode.value
-  const prefix = text.match(/^(问答|文件)\s*[:：]\s*(.+)$/)
+  // 结尾的 `(.+)$` 加了 `s` 标志：`.` 默认不匹配换行，用 Shift+Enter 换过行的消息
+  // 整条匹配不上，模式前缀就等于没写（审查 F5）
+  const prefix = text.match(/^(问答|文件)\s*[:：]\s*(.+)$/s)
   if (prefix) {
     effectiveMode = prefix[1] === '问答' ? 'qa' : 'file'
     effectiveMsg = prefix[2]
@@ -1779,7 +1960,7 @@ async function handleUserMessage(msg: string, forceFileMode = false): Promise<st
         : '🧹 项目记忆本来就是空的，直接说要做什么就好。'
       projectMemoryCount.value = 0
     } catch (e) {
-      chatReply.value = `❌ 清空项目记忆失败：{String(e).slice(0, 120)}`
+      chatReply.value = `❌ 清空项目记忆失败：${String(e).slice(0, 120)}`
     }
     return chatReply.value
   }
@@ -1792,10 +1973,19 @@ async function handleUserMessage(msg: string, forceFileMode = false): Promise<st
     if (isChat) {
       userEmotion = detectEmotion(effectiveMsg)
       if (userEmotion) applyEmotion(userEmotion)
-      addChat('user', effectiveMsg)
+      // 必须 await：`chat_with_deepseek` 一进去就去记忆库捞上下文，
+      // 不等它落库的话，当前这句话有时会**同时**出现在 system prompt 和
+      // user 消息里（审查 F21），模型会以为自己刚说过一遍
+      await addChat('user', effectiveMsg)
     }
 
-    const raw = await invoke<string>('chat_with_deepseek', { msg: effectiveMsg, mode: effectiveMode })
+    const raw = await invoke<string>('chat_with_deepseek', {
+      msg: effectiveMsg,
+      mode: effectiveMode,
+      // 来源要一路传到后端的权限闸门：手机来的写文件/执行命令默认被拒，
+      // 本机来的执行命令会弹确认框。见 agent_guard.rs。
+      source: toolSource,
+    })
     let parsed: any
     try { parsed = JSON.parse(raw) } catch { parsed = { reply: raw } }
     let reply: string = parsed.reply || raw
@@ -1862,6 +2052,18 @@ const PROJECT_RESET_WORDS = [
 const tgChats = ref<Array<{ chat_id: number; title: string }>>([])
 const tgRunning = ref(false)
 const tgError = ref('')
+/**
+ * 配对码状态（安全审查 S3 的修复入口）。
+ *
+ * 一个会话都没绑定时，后端会生成一个 6 位码显示在这里；主人把它发到
+ * Telegram 才能完成绑定。**陌生人猜不到这个码就绑不上**，
+ * 于是"抢先绑定 → 发「文件: …」→ 在自己电脑上执行命令"这条链就断了。
+ */
+const tgPairing = ref<{ needed: boolean; code: string; remaining_secs: number }>({
+  needed: false,
+  code: '',
+  remaining_secs: 0,
+})
 /** 标题栏 📱 按钮的悬浮提示：把「为什么手机上没反应」直接写在脸上 */
 const tgHint = ref('Telegram 通道状态')
 /**
@@ -1871,7 +2073,66 @@ const tgHint = ref('Telegram 通道状态')
  */
 const TG_STALE_SECS = 90
 let tgStatusTimer: ReturnType<typeof setInterval> | null = null
+/** 配对码倒计时（只减不加，真正的有效期以后端为准） */
+let tgPairingTimer: ReturnType<typeof setInterval> | null = null
 let unlistenTg: (() => void) | null = null
+
+// ─── 工具确认弹窗（安全审查 S1）───
+
+/**
+ * 正在等主人点「允许 / 拒绝」的那次工具调用。`null` = 没有待确认的。
+ *
+ * 后端会**阻塞在那里等**（最多 3 分钟，超时按拒绝处理），所以这个弹窗
+ * 必须显眼、必须能一眼看清命令原文 —— 它就是"程序判断不了危不危险、
+ * 让看得懂的人来判断"的那一步。
+ */
+const toolConfirm = ref<{
+  id: number
+  tool: string
+  preview: string
+  source: string
+  timeout_secs: number
+} | null>(null)
+let toolConfirmTimer: ReturnType<typeof setTimeout> | null = null
+let unlistenToolConfirm: (() => void) | null = null
+
+/** 主人点了「允许 / 拒绝」：把答复送回后端，它那边接着往下执行 */
+async function answerToolConfirm(allow: boolean) {
+  const cur = toolConfirm.value
+  if (!cur) return
+  toolConfirm.value = null
+  if (toolConfirmTimer) { clearTimeout(toolConfirmTimer); toolConfirmTimer = null }
+  try {
+    const ok = await invoke<boolean>('tool_confirm_result', { id: cur.id, allow })
+    if (!ok) {
+      // 后端已经超时作废了：不能让主人以为"我点了允许它就执行了"
+      popBubble('这条命令已经等超时了，没有执行～')
+    } else {
+      popBubble(allow ? '好、好的，这就去做……' : '嗯，藿藿不碰它了。')
+    }
+  } catch (e) {
+    // 静默失败是这个项目里明令要避免的：说清"答复没送到"
+    popBubble(`确认答复没送出去：${String(e).slice(0, 80)}`)
+  }
+}
+
+/** 工具的中文名，给弹窗标题用（模型看到的是英文工具名，主人看不懂） */
+const TOOL_LABELS: Record<string, string> = {
+  run_command: '执行 PowerShell 命令',
+  write_file: '写入文件',
+  send_file: '把文件发到 Telegram',
+  forget_project: '清空项目记忆',
+}
+
+/**
+ * 确认框出现 / 消失时重算"窗口哪些地方可点击"。
+ *
+ * 这一步不能省：主窗口是**透明且裁剪**的（只有宠物和面板那块能点），
+ * 新冒出来的面板如果不加进裁剪区，主人根本点不到按钮 ——
+ * 而后端正卡在 confirmation 上等着，看着就像"她突然不理人了"。
+ * 同理，面板关掉之后必须收回去，否则一块透明的区域会挡住桌面的点击。
+ */
+watch(toolConfirm, () => { nextTick(() => updateWindowRegion()) })
 
 /** 管线串行化：TG 消息与本地输入共用 chatReply/记忆/TTS，并发会互相覆盖 */
 let pipelineChain: Promise<unknown> = Promise.resolve()
@@ -1890,7 +2151,7 @@ async function handleTelegramMessage(payload: { chat_id: number; text: string; f
   await enqueuePipeline(async () => {
     // 附件消息强制用文件模式处理这一条（不改持久模式）：
     // 否则在聊天模式下她没有文件工具，文件收到了也读不了
-    const reply = await handleUserMessage(payload.text, payload.attachment === true)
+    const reply = await handleUserMessage(payload.text, payload.attachment === true, 'telegram')
     // 无论如何都不能静默丢掉：手机上「发了没反应」是最难排查的状态
     const text = reply || '（藿藿这边处理完了，但没有内容可以回复）'
     showTgBubble(text)
@@ -1935,6 +2196,12 @@ function refreshTgStatus() {
     tgRunning.value = !!s?.running
     tgChats.value = s?.chats ?? []
     tgError.value = s?.last_error ?? ''
+    // 配对码：只有"一个会话都没绑定"时后端才会给。见 handleTelegramMessage 的说明。
+    tgPairing.value = {
+      needed: !!s?.pairing?.needed,
+      code: String(s?.pairing?.code || ''),
+      remaining_secs: Number(s?.pairing?.remaining_secs || 0),
+    }
     // 心跳：最后一次**成功**轮询距今多久。
     // 这条通道最坑的失败是静默的 —— 梯子断了的时候，手机上既没有回复也没有报错，
     // 用户在手机那头什么线索都拿不到。所以"多久没心跳"必须能在电脑上看见。
@@ -1943,7 +2210,11 @@ function refreshTgStatus() {
     if (!tgRunning.value) {
       tgHint.value = 'Telegram 通道未启动（细节见 %APPDATA%\\desktop-pet\\telegram.log）'
     } else if (tgChats.value.length === 0) {
-      tgHint.value = 'Telegram 已连接，但还没有绑定会话：在手机上给 bot 发一条消息即可绑定'
+      // 原来这里写的是"在手机上发一条消息即可绑定"—— 那正是被修掉的漏洞
+      // （谁先发消息谁绑上）。现在必须带配对码。
+      tgHint.value = tgPairing.value.code
+        ? `等待配对：在手机上给 bot 发 ${tgPairing.value.code}（还剩约 ${Math.ceil(tgPairing.value.remaining_secs / 60)} 分钟）`
+        : '等待配对：点开设置里的「📱 Telegram」生成一个配对码，再用手机发给 bot'
     } else if (age > TG_STALE_SECS) {
       // 心跳比"异常"更值得先说：它直接回答「手机为什么叫不动」
       tgHint.value = `手机通道 ${age} 秒没有心跳 —— 多半是梯子断了，手机发「启动」现在叫不动我（看门狗会一直重试，线路一通就自己恢复）`
@@ -1955,6 +2226,21 @@ function refreshTgStatus() {
       tgHint.value = `Telegram 已绑定 ${tgChats.value.length} 个会话，但还没有成功心跳（点击刷新）`
     }
   }).catch(() => { /* 后端未启动 */ })
+}
+
+/** 生成一个新的配对码（设置面板上的按钮） */
+async function newTgPairing() {
+  try {
+    const r = await invoke<any>('telegram_new_pairing')
+    tgPairing.value = {
+      needed: true,
+      code: String(r?.code || ''),
+      remaining_secs: Number(r?.remaining_secs || 0),
+    }
+    popBubble(`配对码：${tgPairing.value.code}`)
+  } catch (e) {
+    settingsMsg.value = `❌ 生成配对码失败：${String(e).slice(0, 120)}`
+  }
 }
 
 /** 主动推送：新邮件同步到 Telegram（人不在电脑前也能收到） */
@@ -2023,6 +2309,10 @@ let unlistenFocus: (() => void) | null = null
 let unlistenDrop: (() => void) | null = null
 let gazeX = 0, gazeY = 0, gazePaused = false
 let motionPlaying = false
+/** 动作的"代次"：每换一个动作就 +1。一次性动作的完成回调靠它判断
+ *  "我还是当前这个动作吗" —— 否则被下一个动作打断后，晚了半拍的 motionFinish
+ *  会把新动作的 motionPlaying 一起复位掉（见 playOneShotMotion）。 */
+let motionSeq = 0
 let motionTimeout: ReturnType<typeof setTimeout> | null = null
 let lastInteraction = Date.now()
 let isFloating = false
@@ -2054,9 +2344,24 @@ function applyEmotion(exp: string) {
   try { model.expression(exp) } catch {}
   if (emotionTimer) clearTimeout(emotionTimer)
   emotionTimer = setTimeout(() => {
-    try { model?.expression('') } catch {}
+    // 复原不能用 `model.expression('')`：那是按**名字**去找表情，没有名字为空的表情，
+    // 于是什么也不会发生 —— 表情会一直挂在她脸上（审查 F13）。
+    // 正确做法是让 expressionManager 用内置的 defaultExpression 复位
+    // （pixi-live2d-display 这个版本确实有 resetExpression()，见它的类型定义）。
+    resetExpression()
     emotionTimer = null
   }, 3000)
+}
+
+/** 把表情复位成默认表情。模型/表情表缺失时静默跳过，绝不因此中断动作 */
+function resetExpression() {
+  const em = (model as any)?.internalModel?.motionManager?.expressionManager
+  if (!em) return
+  try {
+    if (typeof em.resetExpression === 'function') em.resetExpression()
+    // 兜底：万一这个版本没有 resetExpression，就退回设置第一个可用表情名
+    else if (Array.isArray(em.definitions) && em.definitions[0]?.Name) em.setExpression(em.definitions[0].Name)
+  } catch { /* 模型已销毁等极端情况 */ }
 }
 
 // ─── Window region ───
@@ -2077,7 +2382,7 @@ function updateWindowRegion() {
   let ul = b.x, ut = b.y, ur = b.x + b.width, ub = b.y + b.height
 
   let hasOverlay = false
-  for (const sel of [showChat.value ? '.chat-panel' : '', showMemory.value ? '.memory-panel' : '', showSettings.value ? '.settings-panel' : '', showHelp.value ? '.help-panel' : '', updateDialog.value ? '.update-panel' : '', showIdleBubble.value ? '.idle-bubble' : '', showEmailBubble.value ? '.email-bubble' : '', showInfoPopup.value ? '.info-popup' : '', pieMenuVisible.value ? '.pie-container' : '']) {
+  for (const sel of [showChat.value ? '.chat-panel' : '', showMemory.value ? '.memory-panel' : '', showSettings.value ? '.settings-panel' : '', showHelp.value ? '.help-panel' : '', updateDialog.value ? '.update-panel' : '', showIdleBubble.value ? '.idle-bubble' : '', showEmailBubble.value ? '.email-bubble' : '', showInfoPopup.value ? '.info-popup' : '', pieMenuVisible.value ? '.pie-container' : '', toolConfirm.value ? '.tool-confirm-panel' : '']) {
     if (!sel) continue
     const el = document.querySelector(sel) as HTMLElement | null
     if (el) { hasOverlay = true; const r = el.getBoundingClientRect(); ul = Math.min(ul, r.left); ut = Math.min(ut, r.top); ur = Math.max(ur, r.right); ub = Math.max(ub, r.bottom) }
@@ -2139,7 +2444,7 @@ function showInfoPopupNow() {
   if (showChat.value) return
   const now = new Date()
   todayDateStr.value = formatDateChinese()
-  todayHoliday.value = checkHoliday(now.getMonth() + 1, now.getDate(), now.getDay())
+  todayHoliday.value = checkHoliday(now.getFullYear(), now.getMonth() + 1, now.getDate(), now.getDay())
   refreshInfoPopupStyle()
   showLocationInput.value = !weatherAddress.value.trim()
   if (weatherAddress.value.trim()) {
@@ -2364,10 +2669,19 @@ function setupMouseInteraction(): () => void {
 }
 
 // ─── Gaze ───
+/** 上一轮视线计算还没结束（见 setupGazeTracking 里的说明） */
+let gazeInFlight = false
+
 function setupGazeTracking() {
   if (gazeTimer) clearInterval(gazeTimer)
   gazeTimer = setInterval(async () => {
+    // 一轮没结束就跳过这一轮：这里每 20ms 触发一次，而每轮要串行等 3 次 IPC
+    // （光标位置 + 窗口位置 + 窗口尺寸）。系统一忙这些调用就会超出一轮的时间，
+    // 请求越堆越多，头部参数被过期的光标位置反复拉扯 —— 看起来就是抖动（审查 F16）。
+    // 跳过不影响观感：视线只要跟住大致方向就够了。
+    if (gazeInFlight) return
     if (!model || gazePaused) return
+    gazeInFlight = true
     try {
       const [mx, my] = await invoke<[number, number]>('get_cursor_pos')
       const w = getCurrentWindow()
@@ -2384,7 +2698,11 @@ function setupGazeTracking() {
         try { mm.setParameterValueById('ParamEyeBallY', -gazeY) } catch {}
         try { mm.setParameterValueById('ParamBodyAngleX', gazeX * 10) } catch {}
       }
-    } catch {}
+    } catch {
+      /* 拿不到光标/窗口信息就这一轮不动 */
+    } finally {
+      gazeInFlight = false
+    }
   }, 20)
 }
 
@@ -2415,6 +2733,7 @@ function finishMotion() {
 
 /** 打断当前动作：停循环计时器、恢复视线、停掉所有动作，等 80ms 让 Live2D 稳定 */
 async function stopCurrentMotion() {
+  motionSeq++   // 让上一个一次性动作的完成回调作废，别来动新动作的状态
   if (motionTimeout) { clearTimeout(motionTimeout); motionTimeout = null }
   gazePaused = false
   try { (model as any)?.internalModel?.motionManager?.stopAllMotions() } catch {}
@@ -2423,6 +2742,7 @@ async function stopCurrentMotion() {
 
 /** 启动动作前半段；循环动作会接管并设置结束计时器。返回 true 表示循环动作已接管，调用方直接返回 */
 function beginMotion(name: string): boolean {
+  motionSeq++
   motionPlaying = true
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
   lastMotionName = name
@@ -2439,9 +2759,50 @@ function beginMotion(name: string): boolean {
 /** 一次性动作后半段：播放并调度下一次待机动作 */
 async function playOneShotMotion(name: string) {
   const mm = (model as any)?.internalModel?.motionManager
-  try { const ok = await model!.motion(name, 0, 2); if (!ok && mm) await mm.startMotion(name, 0, 2) } catch {}
-  motionPlaying = false
-  scheduleIdleMotion()
+  // `await model.motion()` 在动作**刚开始**就 resolve（它 resolve 的是"成功启动了"，
+  // 不是"播完了"，见 pixi-live2d-display 的 startMotion）。原来紧接着就
+  // `motionPlaying = false`，于是跳跃类动作刚起跳就被当成结束 ——
+  // updateWindowRegion 的 padTop 不再留余量，动作会被窗口裁掉（审查 F17）。
+  //
+  // 所以改成听 motionManager 的 `motionFinish`（这个版本确实会发，见 dist 里
+  // update() 里 `this.emit("motionFinish")`），按动作的**真实时长**复位；
+  // 再按 Live2D 给的时长挂一个兜底计时器（动作被中途 stopAllMotions 掉时不会发事件，
+  // 没有兜底 motionPlaying 会一直是 true，她就再也不做待机动作了）。
+  let done = false
+  const seq = motionSeq
+  let motionFinishHandler: (() => void) | null = null
+  const finishOnce = () => {
+    if (done) return
+    done = true
+    if (mm && motionFinishHandler) {
+      try { mm.off?.('motionFinish', motionFinishHandler) } catch {}
+    }
+    motionFinishHandler = null
+    // 已经被更晚的动作接管了（stopCurrentMotion / beginMotion 会把代次 +1）：
+    // 这时只摘掉自己的监听器，绝不去改 motionPlaying / motionTimeout
+    if (seq !== motionSeq) return
+    if (motionTimeout) { clearTimeout(motionTimeout); motionTimeout = null }
+    motionPlaying = false
+    scheduleIdleMotion()
+  }
+  motionFinishHandler = () => finishOnce()
+  try { mm?.on?.('motionFinish', motionFinishHandler) } catch { /* 老版本没有这个事件 */ }
+  try {
+    const ok = await model!.motion(name, 0, 2)
+    if (!ok && mm) await mm.startMotion(name, 0, 2)
+  } catch {
+    finishOnce()
+    return
+  }
+  // 兜底时长取 Live2D 解析出来的真实长度（CubismMotion.getLoopDuration()，
+  // 单位是**秒**；`getDuration()` 对循环动作返回 -1，所以先问前者）。
+  // 拿不到就按 5 秒算 —— 宁可早一点复位，也不能让 motionPlaying 永远卡在 true。
+  const motion = mm?.motionGroups?.[name]?.[0]
+  const seconds = Number(motion?.getLoopDuration?.() ?? motion?.getDuration?.())
+  const ms = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 + 250 : 5000
+  if (seq !== motionSeq || done) return
+  if (motionTimeout) clearTimeout(motionTimeout)
+  motionTimeout = setTimeout(finishOnce, ms)
 }
 
 async function playMotion(name: string) {
@@ -2530,6 +2891,10 @@ function onResize() {
   if (model) { model.x = window.innerWidth / 2; model.y = window.innerHeight - 30 }
   if (showMemory.value) updateMemoryPosition()
   if (showHelp.value) updateHelpPosition()
+  // 设置面板和更新对话框也必须重新摆位：这两个的面板是**按窗口坐标算**的，
+  // 换显示器 / 改系统缩放之后窗口尺寸一变，它们就留在原位、跑到窗口外面点不到了（审查 F12）
+  if (showSettings.value) updateSettingsPosition()
+  if (updateDialog.value) updateDrag.position()
   if (showChat.value) {
     updateChatPosition()
     autoGrowInput()   // 窗口尺寸变了，输入框可用高度也要重算
@@ -2546,6 +2911,11 @@ onMounted(async () => {
     // 不能让它变成未捕获的 Promise 拒绝（WebView 控制台会刷红）
     handleTelegramMessage(e.payload).catch(() => {})
   })
+  // 配对码倒计时：状态每 60 秒才拉一次，但码只有 10 分钟寿命 ——
+  // 不自己走秒的话，面板上会一直显示"还剩 10 分钟"，主人会以为它不会过期。
+  tgPairingTimer = setInterval(() => {
+    if (tgPairing.value.remaining_secs > 0) tgPairing.value.remaining_secs -= 1
+  }, 1000)
   refreshTgStatus()
   tgStatusTimer = setInterval(refreshTgStatus, 60000)
 
@@ -2557,6 +2927,34 @@ onMounted(async () => {
   // 纯展示，出错也不该影响主流程，所以不往外抛。
   unlistenFileProgress = await listen<{ text: string }>('pet-file-progress', (e) => {
     fileProgress.value = String(e.payload?.text || '')
+  })
+
+  // ─── 工具确认弹窗（安全审查 S1 的核心修复）───
+  //
+  // 后端在执行 PowerShell 之前会推这个事件、并**在那里等着**（最多 3 分钟，
+  // 超时按拒绝算）。前端只负责把命令原文摆到主人面前。
+  //
+  // 为什么确认必须做在这一层：黑名单一绕就过（`ri -r -fo`、`Format-Volume`、
+  // `powershell -enc` 都不在那 8 个字符串里），程序判断不了"这条命令危不危险"，
+  // 但主人看得懂。所以这里显示的是**原文**，不做任何美化或截断隐藏。
+  unlistenToolConfirm = await listen<any>('tool-confirm-request', (e) => {
+    const p = e.payload || {}
+    toolConfirm.value = {
+      id: Number(p.id || 0),
+      tool: String(p.tool || ''),
+      preview: String(p.preview || ''),
+      source: String(p.source || ''),
+      timeout_secs: Number(p.timeout_secs || 180),
+    }
+    // 无动作 170 秒后自己消失：后端 180 秒超时按拒绝处理，
+    // 留 10 秒余量，免得主人点了按钮却发现"这个请求已经作废了"。
+    if (toolConfirmTimer) clearTimeout(toolConfirmTimer)
+    toolConfirmTimer = setTimeout(() => {
+      if (toolConfirm.value) {
+        toolConfirm.value = null
+        popBubble('那条命令等太久，藿藿当你不同意了……')
+      }
+    }, 170000)
   })
 
   // 更新包的下载进度（几 MB 的包，不给动静的话用户会以为卡死）。
@@ -2602,6 +3000,13 @@ onMounted(async () => {
     if (updateInfo.value.auto_check && updateInfo.value.update_url) checkUpdate(true)
   }, 8000)
 
+  // 收件邮箱轮询（每60秒）。没配置时 checkEmails 会自己早退。
+  // **计时器必须放在 Live2D 加载之前**：模型加载失败时下面会 return，
+  // 原来这一句写在 return 后面，结果模型一坏、邮件就再也不收了（审查 F18）。
+  // 首次收信不能在这里调：这时设置还没加载，has_email_config 还是空的，
+  // checkEmails 会直接早退 —— 所以启动那次放在 loadSettings 之后（见下面）。
+  emailCheckTimer = setInterval(checkEmails, 60000)
+
   if (!canvasRef.value) return
   const el = canvasRef.value
   const W = window.innerWidth, H = window.innerHeight
@@ -2623,6 +3028,10 @@ onMounted(async () => {
     // 语音开关是持久化的，启动时跟着设置走
     volcEnabled.value = settings.value.volc_enabled
   } catch { /* 模型已销毁等极端情况，忽略 */ }
+
+  // 启动后立刻收一次信（计时器在模型加载前已经挂上了，见那里的说明）。
+  // 这时 has_email_config 才知道；没配邮箱的话 checkEmails 自己早退。
+  checkEmails()
 
   // 第一次运行又还没配密钥， 直接把设置面板打开。
   // 程序不再内置密钥了，不主动引导的话用户只会看到「请求失败"而找不到原因」。
@@ -2675,10 +3084,6 @@ onMounted(async () => {
     })
   } catch { /* 拿不到监听也不影响手填 */ }
 
-  // 收件邮箱轮询（每60秒）。没配置时 checkEmails 会自己早退
-  checkEmails()
-  emailCheckTimer = setInterval(checkEmails, 60000)
-
 })
 
 onUnmounted(async () => {
@@ -2695,7 +3100,10 @@ onUnmounted(async () => {
   unlistenFileProgress?.()
   unlistenUpdate?.()
   unlistenHotkey?.()
+  unlistenToolConfirm?.()
   if (tgStatusTimer) clearInterval(tgStatusTimer)
+  if (tgPairingTimer) clearInterval(tgPairingTimer)
+  if (toolConfirmTimer) clearTimeout(toolConfirmTimer)
   if (petScaleSaveTimer) clearTimeout(petScaleSaveTimer)
   window.removeEventListener('resize', onResize)
   if (idleTimer) clearTimeout(idleTimer)
@@ -2720,7 +3128,10 @@ onUnmounted(async () => {
 
     <div v-if="showEmailBubble" class="email-bubble" :style="emailBubbleStyle" @dblclick="showNextEmail()">
       {{ emailBubble }}
-      <button class="email-copy-btn" @click="copyEmailData" title="复制原始数据">📋</button>
+      <span v-if="emailBubbleTip" class="email-copy-tip">{{ emailBubbleTip }}</span>
+      <!-- `@dblclick.stop` 是必须的（审查 D3）：气泡上绑着"双击看下一封"，
+           用户双击复制按钮时会冒泡上去，这封邮件被永久屏蔽 -->
+      <button class="email-copy-btn" @click="copyEmailData" @dblclick.stop title="复制原始数据">📋</button>
     </div>
 
     <div v-if="showChat" class="chat-panel" :style="chatStyle">
@@ -2949,6 +3360,39 @@ onUnmounted(async () => {
       </div>
     </div>
 
+    <!-- 工具确认弹窗：执行 PowerShell 命令前**必须**由主人点一下 -->
+    <!--
+      安全审查 S1 的核心修复。原来靠 8 个固定字符串的黑名单，
+      `ri -r -fo` / `Format-Volume` / `powershell -enc` / `iwr … | iex`
+      全都能绕过去，而且执行前不问任何人。
+
+      现在唯一的判断者是主人自己 —— 所以这个弹窗里显示的是**命令原文**：
+      只截长度、不做任何美化，也不隐藏任何字符。
+      后端在那里阻塞等待（最多 3 分钟，超时按拒绝处理）。
+    -->
+    <div v-if="toolConfirm" class="tool-confirm-panel">
+      <div class="chat-header">
+        <span>⚠️ 藿藿想执行一条命令</span>
+      </div>
+      <div class="tool-confirm-body">
+        <div class="tool-confirm-what">
+          {{ TOOL_LABELS[toolConfirm.tool] || toolConfirm.tool }}
+          <span class="tool-confirm-src">（来自{{ toolConfirm.source }}）</span>
+        </div>
+        <pre class="tool-confirm-cmd">{{ toolConfirm.preview }}</pre>
+        <div class="tool-confirm-warn">
+          这条命令会以你的身份在这台电脑上运行，能做的事情和你自己敲一样多
+          —— 包括删文件、装东西、把数据发出去。
+          <b>看不懂就别点允许。</b>
+          <br />等 {{ Math.round(toolConfirm.timeout_secs / 60) }} 分钟不回答 = 不同意。
+        </div>
+        <div class="tool-confirm-actions">
+          <button class="tool-confirm-allow" @click="answerToolConfirm(true)">允许执行</button>
+          <button class="tool-confirm-deny" @click="answerToolConfirm(false)">拒绝</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 上手说明面板（环形菜单第 8 格 📖 点开） -->
     <div v-if="showHelp" class="help-panel" :style="helpStyle">
       <div
@@ -3025,7 +3469,8 @@ onUnmounted(async () => {
         @pointerdown="onSettingsDragStart"
         @dblclick="resetSettingsPos"
       >
-        <span>⚙️ 藿藿的设置<<span class="settings-ver">{{ settings.version ? 'v' + settings.version : '' }}</span></span>
+        <!-- 这里原来多写了一个 `<`，标题显示成「藿藿的设置<v1.0.2」（审查 F15） -->
+        <span>⚙️ 藿藿的设置<span class="settings-ver">{{ settings.version ? 'v' + settings.version : '' }}</span></span>
         <button class="chat-close" @click="toggleSettings()">✕</button>
       </div>
 
@@ -3287,6 +3732,68 @@ onUnmounted(async () => {
           </div>
           <div v-if="!settings.has_telegram_token" class="setting-warn">
             ⚠️ 还没填 Token —— 手机 Telegram 通道不会启动
+          </div>
+        </div>
+
+        <!-- 5b) 配对码：还绑过任何会话时，必须用这个码才能绑上 -->
+        <!--
+          安全审查 S3：原来是"谁先给 bot 发消息谁就绑上"——配好 token 还没发
+          第一条消息、发了 /unbind、或者换了 bot 之后，抢先私聊的陌生人就成了"主人"，
+          紧接着一条「文件: …」就能让电脑执行命令。
+          现在必须先拿到这个码，而它只显示在这台电脑的屏幕上。
+        -->
+        <div class="setting-row">
+          <label class="setting-label">
+            🔐 手机配对码
+            <span class="setting-value">{{ tgChats.length > 0 ? '已绑定' : '待配对' }}</span>
+          </label>
+          <div v-if="tgChats.length > 0" class="setting-hint">
+            已经绑定 {{ tgChats.length }} 个会话，不需要配对码了。
+            （换手机 / 想重新绑定：在手机里发 <code>/unbind</code>，这里会重新出现配对码）
+          </div>
+          <template v-else>
+            <div class="setting-pair-row">
+              <div class="setting-pair-code" :class="{ empty: !tgPairing.code }">
+                {{ tgPairing.code || '（点右边生成）' }}
+              </div>
+              <button class="setting-eye" @click.stop="newTgPairing()" title="生成一个新的配对码">
+                🔄
+              </button>
+            </div>
+            <div class="setting-hint">
+              在手机 Telegram 里给它发这 6 位数字即可完成绑定
+              {{ tgPairing.code && tgPairing.remaining_secs > 0 ? `（还剩约 ${Math.ceil(tgPairing.remaining_secs / 60)} 分钟，过期会自动换一个）` : '' }}。
+              <br />配对码只显示在这台电脑上 —— 这一步就是为了防止陌生人抢先绑上你的桌宠。
+            </div>
+          </template>
+        </div>
+
+        <!-- 5c) 手机远程控制：默认全关 -->
+        <!--
+          这三个开关默认**全部关闭**：手机随时可以读文件、查天气（这是这条通道的
+          本职工作），但写文件 / 发文件 / 执行命令默认拒绝。
+          注意"允许执行命令"即使打开，每条命令仍然会在电脑上弹窗等你点确认。
+        -->
+        <div class="setting-row">
+          <label class="setting-label">📱 手机远程控制</label>
+          <div class="setting-hint">
+            手机上的请求默认**只能看、不能改**。下面三项是主人主动放权，默认全关。
+          </div>
+          <label class="setting-check">
+            <input type="checkbox" v-model="settings.tg_allow_write" @click.stop />
+            <span>允许手机写文件（只限 桌面 / 下载 / 文档）</span>
+          </label>
+          <label class="setting-check">
+            <input type="checkbox" v-model="settings.tg_allow_send" @click.stop />
+            <span>允许手机把文件发回 Telegram</span>
+          </label>
+          <label class="setting-check">
+            <input type="checkbox" v-model="settings.tg_allow_command" @click.stop />
+            <span>允许手机请求执行命令（每条仍会在这台电脑上弹窗确认）</span>
+          </label>
+          <div v-if="settings.tg_allow_command" class="setting-warn">
+            ⚠️ 已允许手机请求执行命令。请确认这个 bot 只有你自己能私聊 ——
+            陌生人只要能给它发消息，就能让电脑弹出一条命令等你点。
           </div>
         </div>
 
@@ -3722,7 +4229,11 @@ canvas { display: block; width: 100%; height: 100%; pointer-events: auto; }
   margin-left: 6px; flex-shrink: 0;
 }
 .chat-close:hover { background: rgba(255,80,80,0.3); color: #ff4444; }
-.chat-reply { color: #e0e0ff; font-size: 13px; line-height: 1.6; margin-bottom: 10px; padding: 8px; background: rgba(255,255,255,0.06); border-radius: 8px; min-height: 24px; word-break: break-word; }
+/* white-space: pre-wrap —— 模型回复里的换行（问答/文件模式的列表、分段）必须原样显示，
+   少了它整段会被合并成一行（审查 F3；同一个文件里别的气泡都设了，就这里漏了）。
+   max-height + overflow-y —— 面板是靠底边向上撑开的，回复一长就会把 ✕ 和模式按钮
+   顶出窗口、点不到（审查 F8），所以在这里封顶、里面滚动。 */
+.chat-reply { color: #e0e0ff; font-size: 13px; line-height: 1.6; margin-bottom: 10px; padding: 8px; background: rgba(255,255,255,0.06); border-radius: 8px; min-height: 24px; word-break: break-word; white-space: pre-wrap; max-height: 40vh; overflow-y: auto; scrollbar-width: thin; }
 /* 文件模式进度条：一闪一闪的小圆点 + 当前动作，让长活儿看起来"在动" */
 .chat-progress {
   display: flex; align-items: center; gap: 6px;
@@ -3784,7 +4295,9 @@ canvas { display: block; width: 100%; height: 100%; pointer-events: auto; }
   position: absolute; max-width: 300px; padding: 14px 18px;
   background: #fff8e1; border: 2px solid #f9a825; border-radius: 20px;
   color: #5d4037; font-size: 13px; font-weight: 500; line-height: 1.7;
-  text-align: left; z-index: 100001; pointer-events: auto;
+  text-align: left; /* z-index 压在聊天面板（99999）**下面**：聊天面板打开时气泡就算
+                       已经在显示，也只该被面板盖住，而不是反过来挡住输入框（审查 F7）。 */
+  z-index: 99998; pointer-events: auto;
   white-space: pre-wrap; word-break: break-word; box-shadow: 0 2px 12px rgba(0,0,0,0.12);
 }
 .email-copy-btn {
@@ -3793,6 +4306,13 @@ canvas { display: block; width: 100%; height: 100%; pointer-events: auto; }
   font-size: 14px; cursor: pointer; padding: 2px 6px; line-height: 1;
 }
 .email-copy-btn:hover { background: rgba(0,0,0,0.15); }
+/* 复制按钮的即时回音（审查 D3）：没有它用户不确定复制成功没有，
+   会再点一下 —— 那就构成了双击，邮件被永久屏蔽 */
+.email-copy-tip {
+  position: absolute; top: 6px; right: 44px;
+  font-size: 11px; color: #6d4c41; background: rgba(255,255,255,0.85);
+  border-radius: 6px; padding: 2px 6px; pointer-events: none;
+}
 .email-bubble::after {
   content: ''; position: absolute; bottom: -10px; left: 50%; transform: translateX(-50%);
   width: 0; height: 0;
@@ -3869,6 +4389,16 @@ canvas { display: block; width: 100%; height: 100%; pointer-events: auto; }
   padding: 5px 8px; margin-top: 6px; line-height: 1.5;
 }
 .setting-hint code { color: #cfe4ff; background: rgba(255,255,255,0.08); padding: 0 3px; border-radius: 3px; }
+/* 设置里的勾选项（手机远程控制那三项）。用 label 包住 input 是为了
+   点文字也能勾上 —— 这一栏的说明比开关本身长，只能点到那个小方块
+   会很难用。 */
+.setting-check {
+  display: flex; align-items: flex-start; gap: 7px;
+  margin-top: 7px; font-size: 11.5px; color: #d6dce6;
+  line-height: 1.45; cursor: pointer;
+}
+.setting-check input { margin: 1px 0 0; flex: 0 0 auto; cursor: pointer; }
+.setting-check:hover { color: #fff; }
 /* 连接测试结果：成功绿、失败红，带换行（后端给的是多行人话） */
 .setting-test-result {
   font-size: 11px; line-height: 1.6; margin-top: 6px; padding: 6px 8px; border-radius: 6px;
@@ -4003,6 +4533,60 @@ canvas { display: block; width: 100%; height: 100%; pointer-events: auto; }
   padding: 7px 9px; margin-top: 6px;
   scrollbar-width: thin;
 }
+
+/* ── 工具确认弹窗（安全审查 S1）──
+   这是"执行命令"的唯一一道判断：程序判断不了 `ri -r -fo` 危不危险，
+   主人看得懂。所以样式上要**醒目**（红色边框、不透明背景），
+   命令原文要能完整看清（等宽字体、可选中、可滚动）。 */
+.tool-confirm-panel {
+  position: absolute; width: 380px; left: 50%; top: 40%;
+  transform: translateX(-50%);
+  background: rgba(24,10,14,0.98); border: 1px solid rgba(255,110,110,0.75);
+  border-radius: 10px; padding: 0; z-index: 100005; pointer-events: auto; color: #fff;
+  display: flex; flex-direction: column; overflow: hidden;
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 10px 34px rgba(0,0,0,0.6);
+}
+.tool-confirm-panel .chat-header { padding: 10px 14px 6px; margin-bottom: 0; color: #ffb4b4; }
+.tool-confirm-body { padding: 2px 14px 12px; }
+.tool-confirm-what { font-size: 12.5px; margin: 4px 0 6px; }
+.tool-confirm-src { color: #9ab0c8; font-size: 11px; }
+/* 命令原文：等宽 + 保留空白 + 可选中 —— 一个字符都不能藏 */
+.tool-confirm-cmd {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11.5px; line-height: 1.55;
+  color: #ffe08a; background: rgba(0,0,0,0.45);
+  border: 1px solid rgba(255,255,255,0.14); border-radius: 6px;
+  padding: 8px 10px; margin: 0 0 8px;
+  white-space: pre-wrap; word-break: break-all;
+  max-height: 180px; overflow-y: auto;
+  user-select: text; -webkit-user-select: text;
+  scrollbar-width: thin;
+}
+.tool-confirm-warn { font-size: 10.5px; line-height: 1.6; color: rgba(255,255,255,0.62); }
+.tool-confirm-warn b { color: #ff9b9b; }
+.tool-confirm-actions { display: flex; gap: 8px; margin-top: 10px; }
+.tool-confirm-allow {
+  flex: 1; background: rgba(255,90,90,0.22); border: 1px solid rgba(255,110,110,0.7);
+  border-radius: 6px; color: #ffd7d7; padding: 7px 0; font-size: 12px; cursor: pointer;
+}
+.tool-confirm-allow:hover { background: rgba(255,90,90,0.36); }
+.tool-confirm-deny {
+  flex: 1; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.25);
+  border-radius: 6px; color: #dcdcdc; padding: 7px 0; font-size: 12px; cursor: pointer;
+}
+.tool-confirm-deny:hover { background: rgba(255,255,255,0.18); }
+
+/* ── Telegram 配对码（安全审查 S3）── */
+.setting-pair-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.setting-pair-code {
+  flex: 1; font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 20px; letter-spacing: 4px; text-align: center;
+  color: #ffe08a; background: rgba(255,255,255,0.06);
+  border: 1px dashed rgba(255,255,255,0.28); border-radius: 6px;
+  padding: 6px 0; user-select: text; -webkit-user-select: text;
+}
+.setting-pair-code.empty { font-size: 12px; letter-spacing: normal; color: #9ab0c8; }
 
 /* 上手说明面板（环形菜单第 8 格）：尺寸与设置面板一致，好共用同一套自动摆位 */
 .help-panel {

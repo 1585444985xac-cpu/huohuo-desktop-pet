@@ -91,20 +91,24 @@ pub fn parse(accel: &str) -> Result<(u32, u32), String> {
     }
 
     let key = key.ok_or_else(|| format!("「{}」只有修饰键，缺一个主键（比如 H）", text))?;
-    if mods == 0 && is_plain_key(key) {
+    if mods == 0 && !is_function_key(key) {
         return Err(format!(
-            "「{}」只有单个按键：这样会把正常的打字也抢走。请加上 Ctrl / Alt / Shift / Win",
+            "「{}」不能单独用作快捷键：单按一个键会把正常的打字抢走。这个键必须配 Ctrl / Alt / Shift，或者干脆清空这一项（只有 F1–F24 能单独用）",
             text
         ));
     }
     Ok((mods, key))
 }
 
-/// 普通字符键（需要修饰键才允许单独注册）
-fn is_plain_key(vk: u32) -> bool {
-    (0x41..=0x5A).contains(&vk)          // A-Z
-        || (0x30..=0x39).contains(&vk)   // 0-9
-        || (0x60..=0x69).contains(&vk)   // 小键盘 0-9
+/// 功能键（F1–F24）：**只有它们**允许不带修饰键。
+///
+/// 为什么不能像原来那样只拦单个字母和数字（F1）：前端录快捷键时按退格本来是想
+/// 清空这一项，而后端当时只拦字母数字 —— Backspace/Tab/Enter/空格/Delete/方向键
+/// 全都**真的注册成功**了。一旦保存，`RegisterHotKey` 就把整个系统的退格键抢走，
+/// 所有程序里都删不了字。所以这里反过来：没有修饰键时，除功能键外一律拒绝注册，
+/// 而且返回错误让主人看见原因（静默忽略等于"我按了它没反应"，更难排查）。
+fn is_function_key(vk: u32) -> bool {
+    (0x70..=0x87).contains(&vk) // VK_F1 = 0x70 … VK_F24 = 0x87
 }
 
 fn parse_key(part: &str) -> Option<u32> {
@@ -201,6 +205,20 @@ fn format_key(vk: u32) -> String {
         0x28 => "Down".to_string(),
         0x25 => "Left".to_string(),
         0x27 => "Right".to_string(),
+        // 标点键：`parse_key` 认识它们，`format_key` 就必须能把它们写回去（B11）。
+        // 少一个映射，存进设置的就是 `Ctrl+VKC0` —— 下次启动解析不认识，热键静默失效。
+        // 写的是键帽上**不加 Shift** 的字符（美式布局），`parse_key` 两种写法都认。
+        0xC0 => "`".to_string(),
+        0xBD => "-".to_string(),
+        0xBB => "=".to_string(),
+        0xDB => "[".to_string(),
+        0xDD => "]".to_string(),
+        0xDC => "\\".to_string(),
+        0xBA => ";".to_string(),
+        0xDE => "'".to_string(),
+        0xBC => ",".to_string(),
+        0xBE => ".".to_string(),
+        0xBF => "/".to_string(),
         v if (0x70..=0x87).contains(&v) => format!("F{}", v - 0x70 + 1),
         v if (0x41..=0x5A).contains(&v) => char::from_u32(v).unwrap().to_string(),
         v if (0x30..=0x39).contains(&v) => char::from_u32(v).unwrap().to_string(),
@@ -209,6 +227,36 @@ fn format_key(vk: u32) -> String {
 }
 
 // ─── 注册（只在热键线程里调用） ───
+
+/// 自己占用的热键 id 段（避开系统和其他软件习惯用的号段）
+const HOTKEY_ID_BASE: i32 = 0xA000;
+
+/// 一次注册计划里的一项：`(热键 id, 动作 id, 加速键文本)`。
+///
+/// 下标与热键 id 一一对应，**动作跟着 id 走**，而不是"看它在成功列表里排第几"。
+/// 老实现就是栽在这里（B8）：`registered` 只装注册成功的 id，却用它在数组里的位置
+/// 去取 `ACTIONS[idx]` —— 中间一个被清空或注册失败，后面的热键就全部错位，
+/// 按"隐藏"触发的可能是"聊天"。
+fn plan(accels: &[(String, String)]) -> Vec<(i32, String, String)> {
+    accels
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, accel))| !accel.trim().is_empty())
+        .map(|(idx, (action, accel))| {
+            (HOTKEY_ID_BASE + idx as i32, action.clone(), accel.clone())
+        })
+        .collect()
+}
+
+/// `WM_HOTKEY` 里的热键 id → 动作 id。
+///
+/// 只认登记过（注册成功）的 id：没登记过的 id 说明不是我们注册的，绝不能瞎猜一个动作。
+fn action_of<'a>(registered: &'a [(i32, String)], id: i32) -> Option<&'a str> {
+    registered
+        .iter()
+        .find(|(rid, _)| *rid == id)
+        .map(|(_, action)| action.as_str())
+}
 
 #[cfg(windows)]
 mod win {
@@ -295,14 +343,14 @@ fn message_loop(app: &tauri::AppHandle) {
         MsgWaitForMultipleObjects, PeekMessageW, MSG, PM_REMOVE, QS_ALLINPUT,
     };
 
-    // 已经注册过的 id 列表（重新注册时先全部注销）
-    let mut registered: Vec<i32> = Vec::new();
+    // 已经注册过的 (id, 动作)：重新注册时先全部注销
+    let mut registered: Vec<(i32, String)> = Vec::new();
     let mut seen_version = CONFIG_VERSION.load(Ordering::SeqCst);
 
-    let register_all = |registered: &mut Vec<i32>| {
+    let register_all = |registered: &mut Vec<(i32, String)>| {
         // 先清干净：改配置时最容易出错的就是"旧的没注销，新的注册不上"
         unsafe {
-            for id in registered.iter() {
+            for (id, _) in registered.iter() {
                 let _ = UnregisterHotKey(None, *id);
             }
         }
@@ -313,21 +361,17 @@ fn message_loop(app: &tauri::AppHandle) {
             st.errors.clear();
         }
 
-        for (idx, (action, accel)) in crate::settings::hotkeys().iter().enumerate() {
-            if accel.is_empty() {
-                continue;
-            }
-            let (mods, vk) = match parse(accel) {
+        for (id, action, accel) in plan(&crate::settings::hotkeys()) {
+            let (mods, vk) = match parse(&accel) {
                 Ok(v) => v,
                 Err(e) => {
                     state().lock().unwrap().errors.insert(action.clone(), e);
                     continue;
                 }
             };
-            let id = 0xA000 + idx as i32; // 自己的 id 段，避开别人的
             let ok = unsafe { RegisterHotKey(None, id, hk_modifiers(MOD_NOREPEAT | mods), vk).is_ok() };
             if ok {
-                registered.push(id);
+                registered.push((id, action.clone()));
                 state()
                     .lock()
                     .unwrap()
@@ -337,7 +381,7 @@ fn message_loop(app: &tauri::AppHandle) {
                 // 最常见的原因就是被别的软件占了
                 let reason = format!("注册失败：{} 可能已被别的程序占用（换一个组合试试）", accel);
                 crate::telegram::log_line(&format!("[hotkey] {} → {}", action, reason));
-                state().lock().unwrap().errors.insert(action.clone(), reason);
+                state().lock().unwrap().errors.insert(action, reason);
             }
         }
 
@@ -368,10 +412,9 @@ fn message_loop(app: &tauri::AppHandle) {
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() } {
             if msg.message == WM_HOTKEY {
                 let id = msg.wParam.0 as i32;
-                if let Some(idx) = registered.iter().position(|r| *r == id) {
-                    if let Some((action, _)) = ACTIONS.get(idx) {
-                        let _ = app.emit(EVENT, serde_json::json!({ "action": action }));
-                    }
+                // 按 id 查登记表，**不能**用它在 `registered` 里的下标去索引 `ACTIONS`（B8）
+                if let Some(action) = action_of(&registered, id) {
+                    let _ = app.emit(EVENT, serde_json::json!({ "action": action }));
                 }
             }
         }
@@ -436,6 +479,122 @@ mod tests {
     fn function_keys_alone_are_allowed() {
         assert_eq!(normalize("F9").unwrap(), "F9");
         assert_eq!(normalize("F24").unwrap(), "F24");
+    }
+
+    /// B8：中间一个热键被清空或注册失败时，后面的动作**不能错位**
+    #[test]
+    fn b8_id_maps_to_action_even_if_one_is_missing() {
+        let cfg = vec![
+            ("chat".to_string(), "Ctrl+Alt+C".to_string()),
+            ("toggle".to_string(), "".to_string()), // 被主人清空
+            ("action".to_string(), "Ctrl+Alt+A".to_string()),
+        ];
+        let p = plan(&cfg);
+        assert_eq!(
+            p.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![HOTKEY_ID_BASE, HOTKEY_ID_BASE + 2],
+            "id 要跟着配置里的位置走，跳过空项后不能重新编号"
+        );
+        // 模拟"中间那个注册失败"：登记表里只有成功的那两项
+        let registered: Vec<(i32, String)> = vec![
+            (p[0].0, p[0].1.clone()),
+            (p[1].0, p[1].1.clone()),
+        ];
+        // 老实现用 registered 里的下标去取 ACTIONS：0xA002 会落到第 1 位，返回 toggle
+        assert_eq!(action_of(&registered, HOTKEY_ID_BASE + 2), Some("action"));
+        assert_eq!(action_of(&registered, HOTKEY_ID_BASE), Some("chat"));
+        // 没登记过的 id 不能瞎猜（那是别人的热键，或者是失败后残留的）
+        assert_eq!(action_of(&registered, HOTKEY_ID_BASE + 1), None);
+
+        // 三项都在时，每一项都要对上号
+        let all: Vec<(i32, String)> = plan(&cfg).into_iter().map(|(i, a, _)| (i, a)).collect();
+        assert_eq!(action_of(&all, HOTKEY_ID_BASE), Some("chat"));
+    }
+
+    /// B11：`parse_key` 认的每一种键，`format_key` 都要能还原（否则存下来是 `Ctrl+VKC0`，
+    /// 下次启动解析失败、热键静默失效 —— 这类往返测试能一次钉住整张表）
+    #[test]
+    fn b11_every_supported_key_round_trips() {
+        // 无 Shift 的标点写法 + 各种具名键；F 键单独列在后面
+        let named = [
+            "`", "~", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/", "Space", "Enter", "Esc",
+            "Tab", "Backspace", "Delete", "Insert", "Home", "End", "PageUp", "PageDown", "Up",
+            "Down", "Left", "Right",
+        ];
+        for text in named {
+            // 这些键都没有修饰键就注册不了（F1），所以用 Ctrl+ 走一遍
+            let accel = format!("Ctrl+{}", text);
+            let (mods, key) = parse(&accel).unwrap_or_else(|e| panic!("{} 应当能解析: {}", accel, e));
+            let stored = format!("{}{}", format_mods(mods), format_key(key));
+            assert!(
+                !stored.contains("VK"),
+                "{} 存成了 {:?} —— format_key 少了它的反向映射",
+                accel,
+                stored
+            );
+            assert_eq!(normalize(&stored).unwrap(), stored, "存下来的写法必须还能规范化");
+            let (mods2, key2) = parse(&stored).unwrap_or_else(|e| panic!("{} 应当能再解析: {}", stored, e));
+            assert_eq!((mods, key), (mods2, key2), "{} → {:?} 往返后必须是同一个键", accel, stored);
+        }
+        // F1–F24 不带修饰键也要能往返
+        for n in 1..=24 {
+            let accel = format!("F{}", n);
+            let (mods, key) = parse(&accel).unwrap();
+            let stored = format!("{}{}", format_mods(mods), format_key(key));
+            assert_eq!(stored, accel);
+            assert_eq!(parse(&stored).unwrap(), (mods, key));
+        }
+        // 字母数字同样要能还原
+        for c in ["A", "Z", "0", "9", "H"] {
+            let accel = format!("Ctrl+{}", c);
+            let (mods, key) = parse(&accel).unwrap();
+            let stored = format!("{}{}", format_mods(mods), format_key(key));
+            assert_eq!(stored, accel, "{} 应当原样存回来", accel);
+        }
+    }
+
+    /// F1（后端一半）：没有修饰键时，除 F1–F24 外一律拒绝 —— 否则一保存就把
+    /// 整个系统的退格/Tab/回车键抢走
+    #[test]
+    fn f1_backend_bare_editing_keys_are_rejected() {
+        for key in [
+            "Backspace",
+            "Tab",
+            "Enter",
+            "Space",
+            "Delete",
+            "Insert",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "`",
+        ] {
+            let e = normalize(key).expect_err(&format!("{} 不带修饰键时不能被注册", key));
+            assert!(e.contains("Ctrl"), "报错要教主人怎么办，实际：{}", e);
+            assert!(e.contains("抢走"), "要说清后果，实际：{}", e);
+        }
+        // F1–F24 单独用是安全的（F9 之类不会影响打字）
+        for n in 1..=24 {
+            assert!(normalize(&format!("F{}", n)).is_ok(), "F{} 应当允许单独使用", n);
+        }
+        // 带上修饰键就都是正常组合
+        for accel in [
+            "Ctrl+Backspace",
+            "Alt+Tab",
+            "Ctrl+Space",
+            "Shift+Delete",
+            "Ctrl+Up",
+            "Ctrl+Shift+Enter",
+            "Win+Left",
+            "Alt+`",
+        ] {
+            assert!(normalize(accel).is_ok(), "{} 应当被接受", accel);
+        }
     }
 
     /// 状态接口：没配就是空的，不该凭空报"生效"

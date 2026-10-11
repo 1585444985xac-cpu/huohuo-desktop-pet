@@ -15,8 +15,18 @@
 
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::telegram;
+
+/// 拿锁失败时的重试次数与间隔（只对"真有人在跑"判定的准确性有意义）。
+///
+/// 见 [`acquire`] 里的说明：看门狗探测桌宠时会**短暂持锁几十微秒**，
+/// 桌宠恰好在那个窗口启动就会被误判成"第二个实例"。重试 4 次（约 180 毫秒）
+/// 足以错过那个窗口；真已有实例在跑时，重试照样全部失败，只是多花这点时间
+/// 才轮到"请已经在跑的那只现身"。
+const ACQUIRE_RETRIES: u32 = 4;
+const ACQUIRE_RETRY_DELAY: Duration = Duration::from_millis(60);
 
 fn lock_path() -> PathBuf {
     telegram::appdata_dir().join("instance.lock")
@@ -55,21 +65,38 @@ pub(crate) fn acquire_watchdog_instance() -> Option<File> {
 }
 
 fn acquire(path: &Path, what: &str) -> Option<File> {
-    match try_acquire(path) {
-        Ok(f) => Some(f),
-        Err(TryLockError::WouldBlock) => {
-            telegram::log_line(&format!("已经有一个{}在运行，本次启动退出", what));
-            None
-        }
-        // 锁文件所在目录不可写等异常：不阻止启动，但要留下痕迹
-        Err(TryLockError::Error(e)) => {
-            telegram::log_line(&format!(
-                "{}的实例锁获取失败（不影响使用）: {}",
-                what, e
-            ));
-            File::create(std::env::temp_dir().join("desktop-pet-lock-fallback")).ok()
+    // **为什么要重试**（审查报告 B13）：
+    //
+    // 看门狗判断"桌宠在不在运行"的办法是 [`pet_is_running`] —— 它**真的去抢一次
+    // 这把锁**，抢到就立刻放掉。那个"持有"窗口只有几十微秒，可如果桌宠恰好
+    // 落在窗口里启动（手机远程唤起 + 看门狗探测，两边都是自动的，撞上的概率不低），
+    // 它就会看到 WouldBlock，把自己当成"第二个实例"**直接退出** ——
+    // 症状是"点了图标但桌宠没出来"，而且只在特定时序下复现，极难查。
+    //
+    // 短暂重试把这个窗口错过即可：真已有实例在跑时重试同样全部失败，
+    // 只是多花 180 毫秒才轮到 `request_summon()`。
+    for attempt in 0..ACQUIRE_RETRIES {
+        match try_acquire(path) {
+            Ok(f) => return Some(f),
+            Err(TryLockError::WouldBlock) => {
+                if attempt + 1 < ACQUIRE_RETRIES {
+                    std::thread::sleep(ACQUIRE_RETRY_DELAY);
+                    continue;
+                }
+                telegram::log_line(&format!("已经有一个{}在运行，本次启动退出", what));
+                return None;
+            }
+            // 锁文件所在目录不可写等异常：不阻止启动，但要留下痕迹
+            Err(TryLockError::Error(e)) => {
+                telegram::log_line(&format!(
+                    "{}的实例锁获取失败（不影响使用）: {}",
+                    what, e
+                ));
+                return File::create(std::env::temp_dir().join("desktop-pet-lock-fallback")).ok();
+            }
         }
     }
+    None
 }
 
 /// 看门狗用：桌宠当前是否在运行。
@@ -198,6 +225,51 @@ mod tests {
 
         drop(held);
         assert!(!probe(&path, "看门狗"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 审查报告 B13：桌宠拿锁失败时要**短暂重试**，不能一撞上探测就自我了断。
+    ///
+    /// 看门狗用 `pet_is_running()`（真的抢一次锁再放掉，持有窗口只有几十微秒）
+    /// 判断桌宠在不在；桌宠若正好落在那个窗口里启动，就会误判成"第二个实例"
+    /// 直接退出 —— 表现是"点图标没反应"。
+    /// 这里的断言有两层：① 真被别人持有时最终仍要返回 None（不能无限重试）；
+    /// ② 探测（短暂持有后释放）之后紧接着拿锁必须成功。
+    #[test]
+    fn b13_acquire_retries_then_gives_up() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test-b13-retry.lock");
+        let _ = std::fs::remove_file(&path);
+
+        // ① 真的被别人持有时：重试到底仍然要放弃，而且是有界的（不会卡住）
+        let held = try_acquire(&path).expect("第一个句柄应当拿到锁");
+        let start = std::time::Instant::now();
+        assert!(
+            acquire(&path, "测试").is_none(),
+            "锁被真持有时必须放弃启动"
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= ACQUIRE_RETRY_DELAY,
+            "应当真的重试过（等待了 {:?}）",
+            waited
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "重试必须是有界的，实际等了 {:?}",
+            waited
+        );
+
+        // ② 探测（短暂持有 → 立刻释放）之后，桌宠马上就能拿到锁 ——
+        //    这正是"看门狗探测撞上桌宠启动"那个竞态的回归测试
+        drop(held);
+        let _ = probe(&path, "测试"); // probe 自己会持锁几十微秒再放开
+        assert!(
+            acquire(&path, "测试").is_some(),
+            "探测结束后桌宠必须能正常启动"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
