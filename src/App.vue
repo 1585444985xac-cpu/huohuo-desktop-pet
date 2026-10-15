@@ -1169,8 +1169,44 @@ function hotkeyMainKey(e: KeyboardEvent): string {
     Delete: 'Delete', Insert: 'Insert', Home: 'Home', End: 'End',
     PageUp: 'PageUp', PageDown: 'PageDown',
     ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+    // 标点键（与 hotkeys.rs 的 parse_key / format_key 一一对应）：
+    // 后端从 B11 起就支持它们了，但这里以前一个都没认 —— 于是 Ctrl+` 这类组合
+    // 在面板上**根本录不进去**，只会弹一句"这个键暂时不被支持"，而后端明明能注册。
+    // 两边必须成对维护（改一边就改另一边），regression-check 里有跨文件的一致性检查。
+    //
+    // 写的是**键帽上不加 Shift 的那个字符**：`Shift+=` 实际打出 `+`，
+    // 而 `+` 在加速键文本里是分隔符 —— 写 `=` 才不会把文本切坏
+    // （`Shift+-`→`_`、`Shift+;`→`:` 同理，都写不加 Shift 的那个）。
+    Backquote: '`', Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']',
+    Backslash: '\\', Semicolon: ';', Quote: "'", Comma: ',', Period: '.', Slash: '/',
   }
   return map[code] || ''
+}
+
+/** 三个快捷键项（模板与"查重"共用这一份，别在模板里再抄一遍） */
+const HOTKEY_FIELDS = [
+  { field: 'hotkey_chat', label: '聊天面板开关' },
+  { field: 'hotkey_toggle', label: '隐藏 / 显示桌宠' },
+  { field: 'hotkey_action', label: '让她做个动作' },
+]
+
+/**
+ * 两个快捷键是不是同一个组合。
+ *
+ * 按**成分**比，不按字符串比：`Ctrl+Alt+H` 和 `alt+ctrl+h` 是同一个组合，
+ * 大小写与修饰键顺序都不该影响判断（后端也是解析成 mods+vk 之后才比较的）。
+ */
+function sameHotkey(a: string, b: string): boolean {
+  const norm = (s: string) =>
+    (s || '')
+      .split('+')
+      .map((p) => p.trim().toLowerCase())
+      .filter(Boolean)
+      .sort()
+      .join('+')
+  const x = norm(a)
+  const y = norm(b)
+  return x !== '' && x === y
 }
 
 /**
@@ -1217,6 +1253,7 @@ function captureHotkey(e: KeyboardEvent, field: string) {
 
   const main = hotkeyMainKey(e)
   if (!main) {
+    hotkeyRecording.value = ''
     hotkeyMsg.value = `❌ 这个键（${e.key}）暂时不被支持，换一个试试`
     return
   }
@@ -1226,7 +1263,21 @@ function captureHotkey(e: KeyboardEvent, field: string) {
   if (e.altKey) parts.push('Alt')
   if (e.shiftKey) parts.push('Shift')
   if (e.metaKey) parts.push('Win')
-  ;(settings.value as Record<string, any>)[field] = [...parts, main].join('+')
+  const accel = [...parts, main].join('+')
+
+  // 同一个组合不能给两个动作：Windows 的 RegisterHotKey 第二次必然失败，
+  // 而后端只能报一句"可能已被别的程序占用" —— 那会把主人引去查别的软件，
+  // 其实只要换一个组合。所以在这里当场拦住，并说清是被哪一项占了。
+  const taken = HOTKEY_FIELDS.find(
+    (f) => f.field !== field && sameHotkey((settings.value as Record<string, any>)[f.field] || '', accel),
+  )
+  if (taken) {
+    hotkeyRecording.value = ''
+    hotkeyMsg.value = `❌ ${accel} 已经给了「${taken.label}」—— 一个组合只能给一个动作，先清空那一项`
+    return
+  }
+
+  ;(settings.value as Record<string, any>)[field] = accel
   hotkeyMsg.value = ''
   hotkeyRecording.value = ''
 }
@@ -4179,11 +4230,7 @@ onUnmounted(async () => {
 <div class="setting-row" v-if="settingsTab === 'pet'">
           <label class="setting-label">⌨️ 全局快捷键<span class="setting-value">留空 = 不启用</span></label>
           <div
-            v-for="hk in [
-              { field: 'hotkey_chat', label: '聊天面板开关' },
-              { field: 'hotkey_toggle', label: '隐藏 / 显示桌宠' },
-              { field: 'hotkey_action', label: '让她做个动作' },
-            ]"
+            v-for="hk in HOTKEY_FIELDS"
             :key="hk.field"
             class="hotkey-row"
           >
@@ -4220,6 +4267,11 @@ onUnmounted(async () => {
             </div>
           </div>
           <div v-if="hotkeyMsg" class="setting-test-result bad">{{ hotkeyMsg }}</div>
+          <div class="setting-hint">
+            点输入框再按组合键即可录制（退格 = 清空这一项，Esc = 取消）。
+            没有修饰键时**只有 F1–F24** 能用 —— 否则会把退格、回车这类键从整个系统手里抢走。
+            一个组合只能给一个动作；被别的软件占用时会在这里显示原因。
+          </div>
           <div class="setting-hint">
             这几个是<b>全局</b>快捷键：不管当前在哪个软件里，按下都作用到桌宠。
             点输入框再按组合键即可；<b>最好带 Ctrl / Alt</b> —— 只按单个字母会把正常打字抢走，

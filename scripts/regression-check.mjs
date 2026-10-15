@@ -408,9 +408,65 @@ if (badSpawns.length === 0) {
   for (const b of badSpawns) console.log(`   ${b.f}:${b.n}: ${b.line.trim().slice(0, 90)}`)
 }
 
+// ─── 快捷键：前端"能录出来"的键 与 后端"认识"的键必须成对 ───
+//
+// 这一段是**跨文件**的，所以不能用上面的逐行规则：
+// 键盘事件给的是 `e.code`（Backquote / Minus / …），后端认的是键帽字符（` / - / …），
+// 两边各有一张表。少一边的症状是"按了它说这个键不支持"（前端缺）或者
+// "存进去下次启动解析失败、热键静默失效"（后端缺）。
+// 2026-10-15 实测踩到的就是前端缺整张标点表：后端从 B11 起就支持标点，
+// 但 `hotkeyMainKey` 一个都没映射，于是 Ctrl+` 这类组合在面板上根本录不进去。
+checked++
+const PUNCT_CONTRACT = [
+  ['Backquote', '`'],
+  ['Minus', '-'],
+  ['Equal', '='],
+  ['BracketLeft', '['],
+  ['BracketRight', ']'],
+  ['Backslash', '\\\\'],
+  ['Semicolon', ';'],
+  ['Quote', "'"],
+  ['Comma', ','],
+  ['Period', '.'],
+  ['Slash', '/'],
+]
+try {
+  const appVue = readFileSync(FILES['App.vue'], 'utf8')
+  const hkRs = readFileSync(FILES['hotkeys.rs'], 'utf8')
+  const missingFront = []
+  const missingBack = []
+  for (const [code, ch] of PUNCT_CONTRACT) {
+    // 前端：`Backquote: '`'` 这种映射（单引号、双引号都算 —— `Quote: "'"` 只能用双引号写）
+    const esc = ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const frontRe = new RegExp(`${code}:\\s*['"]${esc}['"]`)
+    if (!frontRe.test(appVue)) missingFront.push(`${code} → ${ch}`)
+    // 后端：parse_key 里那个字符的 match 臂（`"`" | "~" => 0xC0` 这种写法）
+    if (!new RegExp(`"${esc}"`).test(hkRs)) missingBack.push(ch)
+  }
+  // 结构化按键（Space/Enter/方向键…）也要两边都在
+  for (const name of ['Space', 'Enter', 'Tab', 'Backspace', 'Delete', 'Insert', 'Home', 'End', 'PageUp', 'PageDown']) {
+    if (!new RegExp(`${name}:\\s*'${name}'`).test(appVue)) missingFront.push(`${name} → ${name}`)
+    if (!new RegExp(`"${name.toLowerCase()}"`).test(hkRs)) missingBack.push(name.toLowerCase())
+  }
+  // 方向键在前端是 ArrowUp→Up 这种改名，单独查
+  for (const [code, name] of [['ArrowUp', 'Up'], ['ArrowDown', 'Down'], ['ArrowLeft', 'Left'], ['ArrowRight', 'Right']]) {
+    if (!new RegExp(`${code}:\\s*'${name}'`).test(appVue)) missingFront.push(`${code} → ${name}`)
+  }
+  if (missingFront.length === 0 && missingBack.length === 0) {
+    console.log('✅ 快捷键  前端能录的标点/功能键与后端 parse_key 一一对应')
+  } else {
+    fails++
+    console.log('❌ 快捷键  前后端的键表对不上（症状：录不进去，或者存了下次启动失效）')
+    if (missingFront.length) console.log(`   前端缺：${missingFront.join('、')}（App.vue 的 hotkeyMainKey）`)
+    if (missingBack.length) console.log(`   后端缺：${missingBack.join('、')}（hotkeys.rs 的 parse_key）`)
+  }
+} catch (e) {
+  fails++
+  console.log(`❌ 快捷键  检查本身出错：${e.message}`)
+}
+
 console.log(
   fails === 0
-    ? `\n${checked} 项回归检查全部通过 ✅（这些坑不会再被顺手改回来）`
-    : `\n有 ${fails} 项回归检查失败 ❌（上面每一条都写了为什么）`
+    ? `\n${checked} 项回归检查全部通过 ✅（这些坑不会再被顺手改回来）`    : `\n有 ${fails} 项回归检查失败 ❌（上面每一条都写了为什么）`
 )
 process.exit(fails === 0 ? 0 : 1)

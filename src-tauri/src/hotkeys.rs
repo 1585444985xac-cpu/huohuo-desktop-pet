@@ -258,6 +258,30 @@ fn action_of<'a>(registered: &'a [(i32, String)], id: i32) -> Option<&'a str> {
         .map(|(_, action)| action.as_str())
 }
 
+/// 两个加速键文本是不是**同一个组合**。
+///
+/// 按解析后的 `(修饰键, 主键)` 比，而不是按字符串比：`Ctrl+Alt+H` 与 `alt+ctrl+h`
+/// 是同一个组合，大小写和修饰键顺序都不该影响判断。
+///
+/// 这条判断存在的唯一理由是**把失败原因说对**：`RegisterHotKey` 失败最常见的原因有两种 ——
+/// 被别的软件占了（要去关掉/换组合），以及**和我们自己另一个动作撞了**（只要换一个组合）。
+/// 后一种如果也报"可能已被别的程序占用"，主人会去查半天别的软件，而问题就在面板上。
+fn same_hotkey(a: &str, b: &str) -> bool {
+    match (parse(a), parse(b)) {
+        (Ok((m1, k1)), Ok((m2, k2))) => k1 != 0 && (m1, k1) == (m2, k2),
+        _ => false,
+    }
+}
+
+/// 动作 id → 给主人看的名字（报错信息里要用）
+fn action_label(id: &str) -> &str {
+    ACTIONS
+        .iter()
+        .find(|(a, _)| *a == id)
+        .map(|(_, label)| *label)
+        .unwrap_or(id)
+}
+
 #[cfg(windows)]
 mod win {
     pub const MOD_ALT: u32 = 0x0001;
@@ -378,8 +402,24 @@ fn message_loop(app: &tauri::AppHandle) {
                     .active
                     .push((action.clone(), accel.clone()));
             } else {
-                // 最常见的原因就是被别的软件占了
-                let reason = format!("注册失败：{} 可能已被别的程序占用（换一个组合试试）", accel);
+                // 失败原因要**说对**：先看是不是和我们自己另一个动作撞了 ——
+                // 那种情况说"可能被别的程序占用"会把主人引去查别的软件，
+                // 其实面板上换一个组合就好了（前端也会在录制时先拦一道）。
+                let dup = {
+                    let st = state().lock().unwrap();
+                    st.active
+                        .iter()
+                        .find(|(a, s)| a != &action && same_hotkey(s, &accel))
+                        .map(|(a, _)| a.clone())
+                };
+                let reason = match dup {
+                    Some(other) => format!(
+                        "注册失败：{} 和「{}」是同一个组合（一个组合只能给一个动作，换一个）",
+                        accel,
+                        action_label(&other)
+                    ),
+                    None => format!("注册失败：{} 可能已被别的程序占用（换一个组合试试）", accel),
+                };
                 crate::telegram::log_line(&format!("[hotkey] {} → {}", action, reason));
                 state().lock().unwrap().errors.insert(action, reason);
             }
@@ -607,6 +647,31 @@ mod tests {
             assert!(!it["id"].as_str().unwrap().is_empty());
             assert!(!it["label"].as_str().unwrap().is_empty());
         }
+    }
+
+    /// 注册失败时**原因要说对**：和自己另一个动作撞了、还是被别的软件占用 ——
+    /// 这两种情况给主人的建议完全不同（换一个组合 / 去关掉别的软件）。
+    /// 判据按解析后的 (修饰键, 主键) 比，不按字符串比。
+    #[test]
+    fn self_conflict_is_detected_by_parsed_value() {
+        // 同一个组合：大小写、修饰键顺序都不该影响判断
+        assert!(same_hotkey("Ctrl+Alt+H", "Ctrl+Alt+H"));
+        assert!(same_hotkey("Ctrl+Alt+H", "alt+ctrl+h"));
+        assert!(same_hotkey("Alt+`", "alt+`"));
+        // 不同组合
+        assert!(!same_hotkey("Ctrl+Alt+H", "Ctrl+Alt+G"));
+        // 多一个修饰键就是**另一个**组合（不然会把正常配置误报成冲突）
+        assert!(!same_hotkey("Ctrl+Alt+H", "Ctrl+Alt+Shift+H"));
+        // 空值与非法值一律不算"撞了"，否则"没设置"会被误报成冲突
+        assert!(!same_hotkey("", ""));
+        assert!(!same_hotkey("", "Ctrl+Alt+H"));
+        assert!(!same_hotkey("瞎写的", "Ctrl+Alt+H"));
+
+        // 报错里要叫得出动作的名字，而不是把内部 id 甩给主人
+        assert_eq!(action_label("chat"), "聊天面板开关");
+        assert_eq!(action_label("toggle"), "隐藏 / 显示桌宠");
+        assert_eq!(action_label("action"), "让她做个动作");
+        assert_eq!(action_label("不认识的"), "不认识的");
     }
 }
 // 构建戳自检：改这一行应当让 build.rs 重跑（戳变化）
