@@ -57,6 +57,12 @@ await ev(`(() => { const c = document.querySelector('canvas'); const r = c.getBo
 await wait(400)
 await ev(`(() => { const g = [...document.querySelectorAll('.pie-container svg g')].find((el) => el.querySelector('circle'))
   g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
+// 设置面板会停在**上次看的那一页**（settingsTab 在内存里留着），而性格这一行在「🐾 桌宠」页。
+// 上一条验收脚本（security-check）跑完可能把面板留在「📱 手机」页 —— 那时 .persona-input
+// 根本不在 DOM 里，整条脚本会全红（2026-10-15 实测）。所以先点一下页签再去等输入框。
+await wait(600)
+await ev(`(() => { const t = document.querySelector('.setting-tab[data-tab="pet"]')
+  if (t) t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
 // 等面板真的渲染出来（见 waitFor 的说明）
 const appeared = await waitFor('.settings-panel .persona-input')
 

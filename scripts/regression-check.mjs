@@ -325,6 +325,45 @@ const FORBIDDEN = [
     negate: true,
     why: '（正向）面板整块可拖时必须"碰到能操作的东西就不拖"，否则想点输入框/开关却把面板拖走了（判据要反过来写：默认可拖，白名单排除）',
   },
+  // ─── 窗口必须铺满工作区（不然面板拖不到屏幕边上，主人反馈过"不能向下移动"）───
+  {
+    id: '窗口几何',
+    file: 'lib.rs',
+    re: /set_size\(tauri::Size::Physical\(area\.size\)\)/,
+    negate: true,
+    why: '（正向）窗口要铺满整块工作区：面板是按窗口坐标夹住的（clampPanelPos），'
+      + '窗口比工作区小/偏 → 面板拖不到屏幕边上，而且会被拖进窗口那块看不见的区域',
+  },
+  {
+    id: '窗口几何',
+    file: 'lib.rs',
+    re: /window_size\.height as i32/,
+    why: '别再把窗口按"工作区右下角往回缩 50/100px"摆：窗口底边离屏幕底 80px，'
+      + '面板就永远拖不到最下面（主人报的"设置界面不能向下移动"就是这么来的）',
+  },
+  {
+    id: '窗口几何',
+    file: 'App.vue',
+    re: /model\.x = window\.innerWidth \/ 2/,
+    why: '藿藿的落脚点要按"距工作区右下角的留白"算（PET_REST_RIGHT / PET_REST_BOTTOM）：'
+      + '窗口已铺满工作区，再按窗口中心/底边摆，它就会横着挪 128px、往下掉 80px',
+  },
+  {
+    id: '窗口几何',
+    file: 'App.vue',
+    re: /applyPetRestPos\(\)/,
+    negate: true,
+    why: '（正向）模型初始化与窗口尺寸变化（onResize）后都得重新摆一次藿藿，漏一处的症状是'
+      + '"改系统缩放/换显示器之后桌宠跑到窗口正中间"',
+  },
+  {
+    id: '窗口几何',
+    file: 'App.vue',
+    re: /const PET_REST_BOTTOM = 110/,
+    negate: true,
+    why: '（正向）距底留白是 110（老窗口几何换算出来的原位置）。'
+      + '改成别的值藿藿会上下跳，改公式前先想想"升级后它还能不能待在原地"',
+  },
 ]
 
 /** 需要读的文件（相对仓库根） */

@@ -4998,26 +4998,32 @@ pub fn run() {
             {
                 let _ = window.set_ignore_cursor_events(true);
                 if let Ok(Some(monitor)) = window.current_monitor() {
+                    // 窗口**铺满整块工作区**（位置也挪到工作区原点）。
+                    //
+                    // 为什么非得这样（主人反馈「设置面板不能向下移动」）：面板是按
+                    // **窗口坐标**夹住的（App.vue::clampPanelPos），而窗口原来只有
+                    // 1200x882、底边还停在工作区底边往上 100 物理 px 的地方 ——
+                    // 于是面板最低只能拖到窗口底边那条线，永远够不到屏幕底部；
+                    // 顶上还多出一截伸到屏幕外，面板又能被拖进那块看不见的地方。
+                    // 窗口 == 工作区之后，窗口坐标就是屏幕坐标，四个方向都没有死区。
+                    //
                     // ① 坐标要加上**这块显示器的原点**（审查报告 B12）：
                     //    副屏的原点常常是负数（主屏左边那块），不带原点算出来的
                     //    x/y 会让窗口跑到主屏上去 —— 副屏用户会觉得"桌宠不见了"。
                     // ② 用**工作区**尺寸而不是整屏尺寸：整屏包含任务栏，
                     //    窗口会被压在任务栏下面（露不出脚）。
-                    // ③ `outer_size()` 原来直接 `unwrap()`：它在窗口还没拿到
-                    //    尺寸时是 Err，会在**启动阶段**直接崩掉整个程序。
+                    // ③ 藿藿在窗口里的落脚点改由 App.vue 的 PET_REST_* 决定 ——
+                    //    窗口一大，原来那条"窗口底边中点上方 30px"会让它乱跑。
                     let area = monitor.work_area();
-                    if let Ok(window_size) = window.outer_size() {
-                        let x = area.position.x + (area.size.width as i32)
-                            - (window_size.width as i32)
-                            - 50;
-                        let y = area.position.y + (area.size.height as i32)
-                            - (window_size.height as i32)
-                            - 100;
-                        let _ = window.set_position(tauri::Position::Physical(
-                            tauri::PhysicalPosition::new(x, y),
-                        ));
-                    } else {
-                        telegram::log_line("启动放窗口时拿不到窗口尺寸，跳过定位（默认位置）");
+                    let _ = window.set_position(tauri::Position::Physical(area.position));
+                    let _ = window.set_size(tauri::Size::Physical(area.size));
+                    // 留痕：窗口实际多大是后面所有面板定位的前提，出问题要能一眼看出来
+                    match window.inner_size() {
+                        Ok(s) => telegram::log_line(&format!(
+                            "窗口已铺满工作区: 工作区 {:?} @ {:?}，窗口客户区 {}x{}",
+                            area.size, area.position, s.width, s.height
+                        )),
+                        Err(e) => telegram::log_line(&format!("窗口已铺满工作区，但读不到尺寸: {e}")),
                     }
                 }
             }

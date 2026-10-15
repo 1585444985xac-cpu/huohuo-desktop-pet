@@ -31,12 +31,31 @@ async function openSettings() {
   await evaluate(`(() => { const g = [...document.querySelectorAll('.pie-container svg g')].find((el) => el.querySelector('circle'))
     g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
   await wait(1500)
+  // 面板会停在**上次看的那一页**（settingsTab 在内存里留着），而快捷键在「🐾 桌宠」页；
+  // 上一条脚本要是把面板留在别的页，这里的 .hotkey-input 就不存在。先钉一下页签。
+  await evaluate(`(() => { const t = document.querySelector('.setting-tab[data-tab="pet"]')
+    if (t) t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
+  await wait(500)
 }
 
 const statusOf = async (id) => {
   const s = await invoke('hotkey_status')
   return (s.v?.items || []).find((x) => x.id === id) || {}
 }
+
+// ── 0) 先记住主人原来的三个快捷键 ──
+// 这条脚本跑的是**主人真实的 settings.json**：下面要录制、保存、清空，
+// 不还原就等于把他自己设的组合键抹掉（2026-10-15 真的抹掉过一次：
+// 主人把「聊天面板开关」设成了 Ctrl+Alt+H，脚本跑完就没了）。
+// 所以：开头快照，结尾原样写回 + apply_hotkeys 让它重新注册。
+const before = await invoke('get_settings')
+const orig = {
+  chat: before.v?.hotkey_chat || '',
+  toggle: before.v?.hotkey_toggle || '',
+  action: before.v?.hotkey_action || '',
+}
+console.log(`（跑之前 chat=${JSON.stringify(orig.chat)} toggle=${JSON.stringify(orig.toggle)} `
+  + `action=${JSON.stringify(orig.action)}，结束会原样写回并重新注册）`)
 
 await openSettings()
 
@@ -69,7 +88,15 @@ await wait(300)
 const captured = await evaluate(`document.querySelectorAll('.hotkey-input')[0].value`)
 check('按下 Ctrl+Alt+H 被录成 "Ctrl+Alt+H"', captured === 'Ctrl+Alt+H', JSON.stringify(captured))
 
-// 只按修饰键不该写入
+// 只按修饰键不该写入。
+// 先把第二个框清空再按：主人的配置里它本来可能就有值（比如 Ctrl+Alt+Q），
+// 不清空的话读到的是"上一次的旧值"，会误报成"写进了半截组合"。
+await evaluate(`(() => {
+  const row = document.querySelectorAll('.hotkey-row')[1]
+  row.querySelector('.link-open').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  return true
+})()`)
+await wait(300)
 const modOnly = await evaluate(`(() => {
   const input = document.querySelectorAll('.hotkey-input')[1]
   input.focus()
@@ -128,6 +155,35 @@ const st3 = await statusOf('chat')
 check('清空后回到"未设置"', st3.accel === '', JSON.stringify(st3))
 const final = await invoke('get_settings')
 check('设置文件里也不留痕迹', final.v?.hotkey_chat === '', JSON.stringify(final.v?.hotkey_chat))
+
+// ── 6) 收尾：把主人原来的三个快捷键原样写回，并让后端重新注册 ──
+// 注意 save_settings 只落盘，**注册要另外调 apply_hotkeys** —— 设置面板上那个
+// "保存"按钮就是这么做的（App.vue:1326），只写文件的话要等下次重启才生效。
+const back = await evaluate(`(async () => {
+  try {
+    await window.__TAURI_INTERNALS__.invoke('save_settings', ${JSON.stringify({
+      hotkeyChat: orig.chat, hotkeyToggle: orig.toggle, hotkeyAction: orig.action,
+    })})
+    await window.__TAURI_INTERNALS__.invoke('apply_hotkeys')
+    await new Promise((r) => setTimeout(r, 1200))
+    const s = await window.__TAURI_INTERNALS__.invoke('get_settings')
+    const st = (await window.__TAURI_INTERNALS__.invoke('hotkey_status')).items || []
+    return { ok: true, s, st }
+  } catch (e) { return { ok: false, err: String(e) } }
+})()`)
+check('收尾：主人的三个快捷键原样还回去了',
+  back?.ok && (back.s?.hotkey_chat || '') === orig.chat
+    && (back.s?.hotkey_toggle || '') === orig.toggle
+    && (back.s?.hotkey_action || '') === orig.action,
+  JSON.stringify([back?.s?.hotkey_chat, back?.s?.hotkey_toggle, back?.s?.hotkey_action]))
+// 原来非空的那几个，后端也得真的重新注册上（状态里能查到同一个组合）
+const stMap = Object.fromEntries((back?.st || []).map((x) => [x.id, x]))
+const okReg = ['chat', 'toggle', 'action'].every((id) => {
+  const want = orig[id]
+  if (!want) return true          // 主人本来就没设过 → 不要求它注册
+  return stMap[id]?.accel === want && stMap[id]?.ok === true
+})
+check('收尾：原来非空的那几个真的重新注册上了', okReg, JSON.stringify(stMap))
 
 ws.close()
 console.log(fails === 0 ? '\n全局快捷键验收全部通过 ✅' : `\n有 ${fails} 项没通过 ❌`)

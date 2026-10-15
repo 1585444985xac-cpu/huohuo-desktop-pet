@@ -56,6 +56,20 @@ function check(name, ok, extra = '') {
 }
 
 // ── 1) 打开饼图（在画布上派发一次右键） ──
+// 先把主人**真实设置里**的三格名称读出来：这条脚本跑的是他自己的 settings.json，
+// 他改过名字（比如第二格叫「网址2」）时，写死"花园/网址/BGM"的断言必然误报。
+// 默认值 = 后端 LINK_DEFAULTS（网址1/网址2/网址3）。
+const settingsNow = await evaluate(`(async () => {
+  try { return await window.__TAURI_INTERNALS__.invoke('get_settings') } catch (e) { return null }
+})()`)
+const expectLabels = [0, 1, 2].map((i) => ((settingsNow?.links?.[i]?.name || '').trim() || ('网址' + (i + 1))))
+// 第一个"没填网址"的格子（用来验"画得更暗""点了给提示"）。都填了就退回中间那格。
+const emptySlot = (() => {
+  const links = settingsNow?.links || []
+  const i = links.findIndex((l) => !l.has_url)
+  return i >= 0 ? i : 1
+})()
+
 await evaluate(`(() => {
   const c = document.querySelector('canvas')
   const r = c.getBoundingClientRect()
@@ -76,17 +90,18 @@ const pie = await evaluate(`(() => {
   return { sectors: paths.length, labels, fills }
 })()`)
 check('饼图渲染出 8 格', pie?.sectors === 8, `实际 ${pie?.sectors}`)
-check('第 4/5/6 格标签 = 花园/网址/BGM',
-  pie?.labels?.[3] === '花园' && pie?.labels?.[4] === '网址' && pie?.labels?.[5] === 'BGM',
-  JSON.stringify(pie?.labels))
+check('第 4/5/6 格标签 = 设置里那三格的名字',
+  pie?.labels?.[3] === expectLabels[0] && pie?.labels?.[4] === expectLabels[1] && pie?.labels?.[5] === expectLabels[2],
+  JSON.stringify(pie?.labels) + '  期望 ' + JSON.stringify(expectLabels))
 check('没配网址的那格画得更暗（视觉上能看出"这里还没填"）',
-  pie?.fills?.[4] !== pie?.fills?.[3], `第4格=${pie?.fills?.[3]} 第5格=${pie?.fills?.[4]}`)
+  pie?.fills?.[3 + emptySlot] !== pie?.fills?.[3 + ((emptySlot + 1) % 3)],
+  `第${4 + emptySlot}格=${pie?.fills?.[3 + emptySlot]} 对照格=${pie?.fills?.[3 + ((emptySlot + 1) % 3)]}`)
 check('原「漂浮」已不在饼图里', !pie?.labels?.includes('漂浮'))
 
-// ── 2) 点没配网址的那格：应当弹提示气泡 ──
+// ── 2) 点没配网址的那格（空的那格）：应当弹提示气泡 ──
 await evaluate(`(() => {
   const paths = [...document.querySelectorAll('.pie-container svg path')]
-  paths[4].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  paths[${3 + emptySlot}].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
   return true
 })()`)
 await wait(900)
@@ -152,8 +167,17 @@ await evaluate(`(() => {
   return true
 })()`)
 await wait(1200)
+// 面板会停在**上次看的那一页**（settingsTab 在内存里留着），而网址快捷键在「🐾 桌宠」页；
+// 上一条脚本要是把面板留在别的页，下面这些行就不存在。先钉一下页签。
+await evaluate(`(() => { const t = document.querySelector('.setting-tab[data-tab="pet"]')
+  if (t) t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
+await wait(500)
 const panel = await evaluate(`(() => {
-  const rows = [...document.querySelectorAll('.link-row')]
+  // 只认"网址快捷键"那三行：.link-row 是通用类（程序位置、邮箱那些行也在用），
+  // 拿它当选择器会把 QQ / 酷狗那两行也算进来 —— 断言就永远是"有 5 行"。
+  // 网址行的标志是里面有 input.link-name（名称框）。
+  // （这段是**页面里**的代码，注释里不许出现反引号：外面那层是模板字符串）
+  const rows = [...document.querySelectorAll('.link-row')].filter((r) => r.querySelector('input.link-name'))
   return {
     count: rows.length,
     values: rows.map((r) => {
@@ -162,9 +186,14 @@ const panel = await evaluate(`(() => {
     }),
     inputsPerRow: rows.map((r) => r.querySelectorAll('input').length),
     hasLabel: !!document.querySelector('.settings-panel .setting-label'),
+    names: rows.map((r) => r.querySelector('input.link-name')?.value || ''),
   }
 })()`)
 check('设置面板里有 3 行网址快捷键', panel?.count === 3, JSON.stringify(panel?.values))
+// 面板显示的名称要和**磁盘上存着的**一致（AGENTS.md 那条：判据用"面板里的值 == 磁盘上的值"）
+check('三行的名称框显示的就是设置里存的值',
+  JSON.stringify(panel?.names || []) === JSON.stringify((settingsNow?.links || []).map((l) => l.name || '')),
+  JSON.stringify(panel?.names) + ' 期望 ' + JSON.stringify((settingsNow?.links || []).map((l) => l.name || '')))
 // 这里**不再断言"默认值是哪几个网址"**：
 //   ① 面板显示的是**磁盘上存着的值**，而这条脚本跑的是主人真实的 settings.json ——
 //      他要是自己填过网址，断言"默认值"必然误报；

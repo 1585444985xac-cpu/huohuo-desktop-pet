@@ -2875,12 +2875,22 @@ function setupGazeTracking() {
     // 跳过不影响观感：视线只要跟住大致方向就够了。
     if (gazeInFlight) return
     if (!model || gazePaused) return
+    // 快照一份：下面有 await，TS 就不认 `model` 还非空了
+    const m = model
     gazeInFlight = true
     try {
       const [mx, my] = await invoke<[number, number]>('get_cursor_pos')
       const w = getCurrentWindow()
-      const pos = await w.outerPosition(); const size = await w.outerSize()
-      const cx = pos.x + size.width / 2; const cy = pos.y + size.height * 0.15
+      const pos = await w.outerPosition()
+      // 注视的目标点是**藿藿的脸**，所以要用她自己的坐标算。
+      // 原来用的是"窗口中心 / 窗口高度的 15%"—— 那时窗口就是围着她的那一小块，
+      // 换算下来正好是她的头；现在窗口铺满整块工作区（见 lib.rs 的说明），
+      // 窗口中心变成了屏幕中心，她就会一直朝屏幕中间看。
+      // `get_cursor_pos` 与 `outerPosition()` 都是**物理**像素，模型的 bounds 是 CSS 像素。
+      const dpr = window.devicePixelRatio || 1
+      const b = m.getBounds()
+      const cx = pos.x + (b.x + b.width / 2) * dpr
+      const cy = pos.y + (b.y + b.height * 0.15) * dpr
       const speed = 0.32
       gazeX += (Math.max(-1, Math.min(1, (mx - cx) / 300)) - gazeX) * speed
       gazeY += (Math.max(-1, Math.min(1, (my - cy) / 300)) - gazeY) * speed
@@ -3079,10 +3089,31 @@ function scheduleIdleMotion() {
   }, 8000 + Math.random() * 10000)
 }
 
+/** 藿藿的落脚点：距工作区右边缘多远、脚底距工作区底边多远（窗口坐标 = 屏幕坐标）。
+ *
+ *  为什么要写死成"离右下角多远"，而不是原来的"窗口正中间 / 窗口底边往上 30px"：
+ *  窗口过去是 1200x882 的一小块，停在工作区右下角附近，那两条公式刚好把藿藿摆在
+ *  现在这个位置；而窗口现在**铺满整块工作区**（原因见 `lib.rs` 里 setup 的说明：
+ *  面板是按窗口坐标夹的，窗口够不到屏幕底，面板就永远拖不下去）。
+ *  窗口一变，按窗口算的坐标就让藿藿横着挪 128px、往下掉 80px —— 用户的桌宠不许乱跑。
+ *
+ *  数值是老几何换算来的，保证升级后藿藿待在原地：
+ *    距右 = 600（老窗口 1200 的一半）+ 40（老窗口右边距工作区右缘 50 物理 px）
+ *    距底 = 30（老公式的 H-30）+ 80（老窗口底边离工作区底边 100 物理 px） */
+const PET_REST_RIGHT = 640
+const PET_REST_BOTTOM = 110
+
+function applyPetRestPos() {
+  if (!model) return
+  model.anchor.set(0.5, 1)
+  model.x = window.innerWidth - PET_REST_RIGHT
+  model.y = window.innerHeight - PET_REST_BOTTOM
+}
+
 function onResize() {
   if (!app) return
   app.renderer.resize(window.innerWidth, window.innerHeight)
-  if (model) { model.x = window.innerWidth / 2; model.y = window.innerHeight - 30 }
+  applyPetRestPos()
   if (showMemory.value) updateMemoryPosition()
   if (showHelp.value) updateHelpPosition()
   // 设置面板和更新对话框也必须重新摆位：这两个的面板是**按窗口坐标算**的，
@@ -3211,8 +3242,17 @@ onMounted(async () => {
   try { model = await Live2DModel.from('/model/character/huohuo.model3.json') }
   catch (err: any) { return }
 
-  model.anchor.set(0.5, 1); model.scale.set(settings.value.pet_scale); model.x = W / 2; model.y = H - 30
+  model.anchor.set(0.5, 1); model.scale.set(settings.value.pet_scale); applyPetRestPos()
   app.stage.addChild(model)
+
+  // 验收脚本的口子（和 `__petFloatIdleSeconds` 同一套路，只读、不改状态）：
+  // 「窗口多大 / 藿藿摆在哪儿」这两个量只有界面自己知道，没有这个口子就只能靠读代码推理。
+  // 本次"窗口铺满工作区"的改动就是靠它验的：窗口尺寸变了，藿藿必须还在原来的位置。
+  ;(window as unknown as { __petGeom?: () => unknown }).__petGeom = () => (model ? {
+    win: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1 },
+    rest: { x: model.x, y: model.y },
+    bounds: model.getBounds(),
+  } : null)
 
   // 拉一次设置：桌宠大小、天气地点都按用户保存的值来（拉不到就用默认值）
   await loadSettings()

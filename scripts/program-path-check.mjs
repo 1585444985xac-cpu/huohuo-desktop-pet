@@ -21,6 +21,20 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 let fails = 0
 const check = (name, ok, extra = '') => { console.log(`${ok ? '✅' : '❌'} ${name}${extra ? '  ' + extra : ''}`); if (!ok) fails++ }
 
+// ── 0) 先记住主人原来填的程序位置 ──
+// 这条脚本跑的是**主人真实的 settings.json**：下面第 4 步要写测试值、还要清空，
+// 不还原就等于把主人自己填的 QQ 路径抹掉（2026-10-15 真的抹过一次，靠面板上的
+// 回显和 WebView2 的 leveldb 里的旧值才查回来）。所以：开头快照，结尾原样写回。
+const getSettings = () => evaluate(`window.__TAURI_INTERNALS__.invoke('get_settings')`)
+const saveSettings = (args) => evaluate(`(async () => {
+  try { await window.__TAURI_INTERNALS__.invoke('save_settings', ${JSON.stringify(args)}); return { ok: true } }
+  catch (e) { return { ok: false, err: String(e) } }
+})()`)
+const before = await getSettings()
+const origQq = before?.qq_path || ''
+const origKg = before?.kugou_path || ''
+console.log(`（跑之前 QQ=${JSON.stringify(origQq)} 酷狗=${JSON.stringify(origKg)}，结束会原样写回）`)
+
 // 打开设置面板
 await evaluate(`(() => { const c = document.querySelector('canvas'); const r = c.getBoundingClientRect()
   c.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.width*0.6, clientY: r.height*0.4 })); return true })()`)
@@ -29,6 +43,11 @@ await evaluate(`(() => {
   const g = [...document.querySelectorAll('.pie-container svg g')].find((el) => el.querySelector('circle'))
   g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
 await wait(1500)
+// 面板会停在**上次看的那一页**（settingsTab 在内存里留着），而程序位置在「🐾 桌宠」页；
+// 上一条脚本要是把面板留在别的页，这里的 QQ / 酷狗 输入框就不存在。先钉一下页签。
+await evaluate(`(() => { const t = document.querySelector('.setting-tab[data-tab="pet"]')
+  if (t) t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
+await wait(500)
 
 // 1) 两个拖放目标 + 虚线样式
 const dom = await evaluate(`(() => {
@@ -56,7 +75,11 @@ const dom = await evaluate(`(() => {
 check('设置面板里有 QQ / 酷狗 两个可拖放输入框', !!dom?.qq && !!dom?.kg, JSON.stringify([dom?.qq?.w, dom?.kg?.w]))
 check('输入框用虚线边框提示"可以拖进来"', dom?.qq?.dashed === 'dashed', `border-style=${dom?.qq?.dashed}`)
 check('落点换算正确（elementFromPoint 命中同一个框）', dom?.hit === 'qq_path', String(dom?.hit))
-check('默认都是空（= 自动查找）', (dom?.qq?.value || '') === '' && (dom?.kg?.value || '') === '')
+// 不写"默认必须是空的"：面板显示的是**磁盘上存着的值**，主人自己填过 QQ 路径时
+// 那条断言必然误报。改成钉住 AGENTS.md 里那条判据 —— 面板里的值 == 磁盘上的值。
+check('面板里显示的就是设置里存的值（没存过 = 空 = 自动查找）',
+  (dom?.qq?.value || '') === origQq && (dom?.kg?.value || '') === origKg,
+  JSON.stringify([dom?.qq?.value, dom?.kg?.value]) + ' 磁盘 ' + JSON.stringify([origQq, origKg]))
 check('面板里有「🖥 程序位置」这一节', JSON.stringify(dom?.labels || []).includes('程序位置'), JSON.stringify(dom?.labels))
 
 // 3) 真的调一次 resolve_shortcut：把桌面上的桌宠快捷方式解析成 .exe
@@ -99,7 +122,14 @@ const cleared = await evaluate(`(async () => {
     return { ok: true, val: s.qq_path }
   } catch (e) { return { ok: false, err: String(e) } }
 })()`)
-check('清空后回到"自动查找"（验收不留副作用）', cleared?.ok && cleared.val === '', JSON.stringify(cleared))
+check('清空后回到"自动查找"', cleared?.ok && cleared.val === '', JSON.stringify(cleared))
+
+// 5) 收尾：把主人原来的值原样写回（包括"他本来就没填"这种情况）
+const restored = await saveSettings({ qqPath: origQq, kugouPath: origKg })
+const after = await getSettings()
+check('收尾：主人的程序位置原样还回去了',
+  restored?.ok && (after?.qq_path || '') === origQq && (after?.kugou_path || '') === origKg,
+  JSON.stringify({ qq: after?.qq_path, kugou: after?.kugou_path }))
 
 console.log(fails === 0 ? '\n全部通过 ✅' : `\n有 ${fails} 项没通过 ❌`)
 ws.close()

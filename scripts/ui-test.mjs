@@ -186,8 +186,73 @@ const report = await evaluate(`(async () => {
 
   // ── 9) 顺带看一眼邮箱设置区块是否真的渲染出来了 ──
   const rows = [...panel2.querySelectorAll('.setting-row')].map(r =>
-    (r.querySelector('.setting-label')?.textContent || '').trim().replace(/\\s+/g, ' '))
+    (r.querySelector('.setting-label')?.textContent || '').trim().replace(/\s+/g, ' '))
   out.settingRows = rows
+
+  // ── 10) 藿藿的落脚点：窗口铺满工作区之后最容易踩的一条 ──
+  // 窗口尺寸从 1200x882 变成整块工作区时，模型如果还按"窗口中心 / 窗口底边往上 30px"摆，
+  // 藿藿就会横着挪 128px、往下掉 80px —— 用户的桌宠不许乱跑，所以钉住它。
+  const g = (typeof window.__petGeom === 'function') ? window.__petGeom() : null
+  if (!g) fail('页面没有暴露 __petGeom，没法验藿藿的位置')
+  else {
+    const feetFromBottom = g.win.h - (g.bounds.y + g.bounds.height)
+    const centerFromRight = g.win.w - (g.bounds.x + g.bounds.width / 2)
+    out.petGeom = {
+      win: g.win,
+      feetFromBottom: Math.round(feetFromBottom),
+      centerFromRight: Math.round(centerFromRight),
+      modelSize: Math.round(g.bounds.width) + 'x' + Math.round(g.bounds.height),
+    }
+    if (feetFromBottom < 80 || feetFromBottom > 160) {
+      fail('藿藿的脚离窗口底边 ' + Math.round(feetFromBottom) + 'px（应约 110）——窗口尺寸一变它就挪位置了')
+    } else log('✓ 藿藿脚底离窗口底边 ' + Math.round(feetFromBottom) + 'px（老位置，没动）')
+    if (centerFromRight > g.win.w / 2) {
+      fail('藿藿跑到屏幕中间去了（距右边缘 ' + Math.round(centerFromRight) + 'px）')
+    } else log('✓ 藿藿仍在右边（距右边缘 ' + Math.round(centerFromRight) + 'px）')
+  }
+
+  // ── 11) 面板能不能拖到工作区最下面（主人报的"设置界面不能向下移动"）──
+  // 面板是按**窗口坐标**夹住的（clampPanelPos），窗口 == 工作区时窗口底边就是屏幕底边，
+  // 所以"能贴到 innerHeight"就等于"能拖到屏幕最下面"。
+  const rBefore = panel2.getBoundingClientRect()
+  const down = window.innerHeight - rBefore.bottom + 200   // 故意多给 200px，看它被夹在哪儿
+  const hx2 = rBefore.left + 110, hy2 = rBefore.top + 12
+  header2.dispatchEvent(mk('pointerdown', hx2, hy2))
+  for (let i = 1; i <= 16; i++) {
+    header2.dispatchEvent(mk('pointermove', hx2, hy2 + down * i / 16))
+    await sleep(16)
+  }
+  header2.dispatchEvent(mk('pointerup', hx2, hy2 + down))
+  await sleep(250)
+  const rDown = panel2.getBoundingClientRect()
+  out.dragDown = { top: Math.round(rDown.top), bottom: Math.round(rDown.bottom),
+                   windowH: window.innerHeight, gapToBottom: Math.round(window.innerHeight - rDown.bottom) }
+  if (window.innerHeight - rDown.bottom > 4) {
+    fail('面板拖不到窗口（=工作区）底部，还差 ' + Math.round(window.innerHeight - rDown.bottom) + 'px')
+  } else log('✓ 面板能一直拖到工作区底边（离底 ' + Math.round(window.innerHeight - rDown.bottom) + 'px）')
+
+  // ── 12) 往上拖也不能被拖到看不见的地方（窗口顶上那块以前在屏幕外）──
+  const hx3 = rDown.left + 110, hy3 = rDown.top + 12
+  header2.dispatchEvent(mk('pointerdown', hx3, hy3))
+  for (let i = 1; i <= 16; i++) {
+    header2.dispatchEvent(mk('pointermove', hx3, hy3 - 900 * i / 16))
+    await sleep(16)
+  }
+  header2.dispatchEvent(mk('pointerup', hx3, hy3 - 900))
+  await sleep(250)
+  const rUp = panel2.getBoundingClientRect()
+  out.dragUp = { top: Math.round(rUp.top) }
+  if (rUp.top < 0) {
+    fail('面板被拖到窗口顶边以外（top=' + Math.round(rUp.top) + '），标题栏会看不见')
+  } else log('✓ 往上拖最多贴到窗口顶边（top=' + Math.round(rUp.top) + '）')
+
+  // 收尾：位置记忆是**主人的真实配置**，验收留下的坐标必须清掉、面板关回去
+  localStorage.removeItem('huohuo_settings_pos')
+  panel2.querySelector('.chat-close')?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await sleep(300)
+  out.cleanedUp = localStorage.getItem('huohuo_settings_pos') === null && !document.querySelector('.settings-panel')
+  if (!out.cleanedUp) fail('收尾没干净：位置记忆或面板状态留在界面上了')
+  else log('✓ 已清掉位置记忆并关掉面板（不动主人的配置）')
 
   return out
 })()`)

@@ -134,6 +134,11 @@ await evaluate(`(() => {
   const g = [...document.querySelectorAll('.pie-container svg g')].find((el) => el.querySelector('circle'))
   g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
 await wait(1500)
+// 面板会停在**上次看的那一页**（settingsTab 在内存里留着），而程序位置在「🐾 桌宠」页；
+// 上一条脚本要是把面板留在别的页，这两个输入框就不在 DOM 里（2026-10-15 实测假失败过一次）。
+await evaluate(`(() => { const t = document.querySelector('.setting-tab[data-tab="pet"]')
+  if (t) t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
+await wait(500)
 const targets = await evaluate(`(() => ({
   qq: !!document.querySelector('[data-drop-target="qq_path"]'),
   kg: !!document.querySelector('[data-drop-target="kugou_path"]'),
