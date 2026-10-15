@@ -317,6 +317,14 @@ const FORBIDDEN = [
     negate: true,
     why: '（正向）build.rs 必须声明前端 dist：只改 App.vue 时它不重跑的话，戳会冻在上一版，而客户端只按戳判断新旧 —— 等于"发了前端修复，所有人收不到"',
   },
+  // ─── 面板"整块可拖"必须排除可操作控件 ───
+  {
+    id: '整块可拖',
+    file: 'App.vue',
+    re: /closest\('input, select, textarea, button, a, \[data-no-drag\]'\)/,
+    negate: true,
+    why: '（正向）面板整块可拖时必须"碰到能操作的东西就不拖"，否则想点输入框/开关却把面板拖走了（判据要反过来写：默认可拖，白名单排除）',
+  },
 ]
 
 /** 需要读的文件（相对仓库根） */

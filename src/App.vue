@@ -473,6 +473,10 @@ function createPanelDrag(cfg: {
   /** 按住标题栏拖动 */
   function onDragStart(e: PointerEvent) {
     if (e.button !== 0) return
+    // 已经在拖了就直接返回：面板整块都挂了 pointerdown（见 onPanelPointerDown），
+    // 在标题栏上按下时它会冒泡上来再走一遍 —— 不去重就会挂两套监听、
+    // 松手时存两次位置（结果一样，但没必要）。
+    if (panelDragging) return
     // 标题栏上一般还有关闭/记忆等按钮，别把它们变成拖动把手
     if ((e.target as HTMLElement).closest('button')) return
 
@@ -553,7 +557,26 @@ function createPanelDrag(cfg: {
     updateWindowRegion()
   }
 
-  return { position, restore, onDragStart, reset }
+  /**
+   * 面板**整块**都能按住拖：连内部四周的空白（行距、页签条两侧、内边距）一起算作把手。
+   *
+   * 为什么不是"把标题栏做粗一点"：标题栏又窄又挤着按钮，够它本身就费劲，
+   * 而面板里真正能按的地方大多是空白。
+   *
+   * 判据**反过来写**：碰到能操作的东西就不拖（输入框、下拉、文本域、按钮、链接、
+   * 滑块，以及标了 `data-no-drag` 的）。这样以后新加的控件自动是"不可拖"的 ——
+   * 失败方向安全：顶多是那一块不能拖，而不是"想点它却把面板拖走了"。
+   */
+  function onPanelPointerDown(e: PointerEvent) {
+    const el = e.target as HTMLElement | null
+    if (!el || typeof el.closest !== 'function') return
+    if (el.closest('input, select, textarea, button, a, [data-no-drag]')) return
+    // 滚动条那 4px 不算把手：用户是想滚，不是想挪面板
+    if (el.classList?.contains('settings-body') && e.offsetX >= el.clientWidth) return
+    onDragStart(e)
+  }
+
+  return { position, restore, onDragStart, onPanelPointerDown, reset }
 }
 
 // ── 设置面板 ──
@@ -618,6 +641,8 @@ settingsDrag.restore()
 
 function updateSettingsPosition() { settingsDrag.position() }
 function onSettingsDragStart(e: PointerEvent) { settingsDrag.onDragStart(e) }
+/** 面板任意空白处按住都能拖（内部四周的留白也算，不用非去够那条窄标题栏） */
+function onSettingsPanelPointerDown(e: PointerEvent) { settingsDrag.onPanelPointerDown(e) }
 function resetSettingsPos() { settingsDrag.reset() }
 
 // ── 上手说明面板 ──
@@ -3647,10 +3672,19 @@ onUnmounted(async () => {
     </div>
 
     <!-- 设置面板（环形菜单中央 ⚙️ 点开） -->
-    <div v-if="showSettings" class="settings-panel" :style="settingsStyle">
+    <!-- 面板**整块**都能拖：内部四周的留白、行距、页签条两侧都算把手（见 onSettingsPanelPointerDown）。
+         标题栏那条仍然单独挂着 pointerdown —— 它是`panel-drag-handle`（光标变 move），
+         而且验收脚本 ui-test / verify-after-repair 就是朝它派发 pointerdown 的，别拆掉。
+         两者不会打架：onDragStart 开头有"已经在拖就直接返回"的判重。 -->
+    <div
+      v-if="showSettings"
+      class="settings-panel"
+      :style="settingsStyle"
+      @pointerdown="onSettingsPanelPointerDown"
+    >
       <div
         class="chat-header panel-drag-handle"
-        title="按住这里可以把设置面板拖到任意位置；双击恢复跟随桌宠"
+        title="按住面板里任意空白处都能拖动；双击这里恢复跟随桌宠"
         @pointerdown="onSettingsDragStart"
         @dblclick="resetSettingsPos"
       >
@@ -4565,6 +4599,12 @@ canvas { display: block; width: 100%; height: 100%; pointer-events: auto; }
   flex: 1; overflow-y: auto; padding: 4px 14px 10px;
   scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.2) transparent;
 }
+/* 面板内部四周的留白也是"拖动把手"，给个 move 光标让人看得出来（见 onSettingsPanelPointerDown）。
+   能操作的东西各自恢复自己的光标，别让输入框上也显示 move。 */
+.settings-body, .setting-tabs { cursor: move; }
+.settings-body input, .settings-body textarea, .settings-body select,
+.settings-body button, .settings-body a { cursor: auto; }
+.settings-body input[type='range'] { cursor: pointer; }
 /* 分类页签：六颗等宽按钮铺满一行（面板宽 340，去掉左右内边距刚好） */
 .setting-tabs {
   display: flex; gap: 2px; padding: 0 10px 6px;

@@ -85,7 +85,9 @@ const report = await evaluate(`(async () => {
   const header = panel.querySelector('.chat-header')
   if (!header) { fail('找不到标题栏'); return out }
   out.headerClass = header.className
-  if (!header.classList.contains('settings-drag-handle')) fail('标题栏没有拖动把手类')
+  // 类名是 panel-drag-handle（settings-drag-handle 是很久以前的名字，
+  // 这条断言一直没跟着改 —— 无论面板怎么改它都会报「没有拖动把手类」）
+  if (!header.classList.contains('panel-drag-handle')) fail('标题栏没有拖动把手类')
   else log('✓ 标题栏是拖动把手: ' + header.className)
   out.headerCursor = getComputedStyle(header).cursor
   if (out.headerCursor !== 'move') fail('光标不是 move，实际 ' + out.headerCursor)
