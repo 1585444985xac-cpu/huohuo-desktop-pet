@@ -309,6 +309,14 @@ const FORBIDDEN = [
     negate: true,
     why: '（正向）默认页必须是「桌宠」：四个验收脚本要在默认页上找自己的控件，改成别的页它们会集体失败',
   },
+  // ─── 构建戳不能被冻住（冻住 = 只改前端的版本发不出去）───
+  {
+    id: '构建戳',
+    file: 'build.rs',
+    re: /rerun-if-changed=\.\.\/dist/,
+    negate: true,
+    why: '（正向）build.rs 必须声明前端 dist：只改 App.vue 时它不重跑的话，戳会冻在上一版，而客户端只按戳判断新旧 —— 等于"发了前端修复，所有人收不到"',
+  },
 ]
 
 /** 需要读的文件（相对仓库根） */
@@ -321,6 +329,7 @@ const FILES = {
   'db.rs': join(SRC, 'db.rs'),
   'update.rs': join(SRC, 'update.rs'),
   'project.rs': join(SRC, 'project.rs'),
+  'build.rs': join(ROOT, 'src-tauri', 'build.rs'),
   'App.vue': join(ROOT, 'src', 'App.vue'),
   // 发布/验收脚本也在扫描范围内：私钥路径、个人主页这类"作者环境信息"最容易藏在脚本里
   'make-update-manifest.mjs': join(ROOT, 'scripts', 'make-update-manifest.mjs'),

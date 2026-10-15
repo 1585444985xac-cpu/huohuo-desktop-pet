@@ -39,5 +39,17 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
+    // **前端也要声明**（2026-10-15 实测踩到的那一次）：
+    //
+    // 上面那三条只覆盖 Rust 那一半。只改 `App.vue` 时：前端**会**重新编进二进制
+    // （lib 依赖那些按哈希命名的资源文件，换了名字就会重编），但 build.rs 不会重跑 ——
+    // 于是戳停在上一版。看起来只是"面板上构建时间显示旧了"，真正的后果是
+    // `build_epoch()`（编译期注入的 PATH 变量）没变 → `version_code` 没变 →
+    // **只改前端的版本发出去，所有客户端都认为"不比我新"而拒收**。
+    // 判据是"这次前端构建产物的时间"，所以盯 dist 里每次都会被重写的那个文件；
+    // 目录本身也声明上（vite 会增删按哈希命名的资源，目录 mtime 跟着变）。
+    println!("cargo:rerun-if-changed=../dist/index.html");
+    println!("cargo:rerun-if-changed=../dist");
+
     tauri_build::build()
 }
