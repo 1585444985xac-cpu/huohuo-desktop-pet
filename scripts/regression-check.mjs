@@ -294,6 +294,21 @@ const FORBIDDEN = [
     negate: true,
     why: '（正向）看门狗主循环里要自己看开关并退出 —— 两者是同一个 exe，不能靠按名字杀进程来关它',
   },
+  // ─── 设置面板的分类页 ───
+  {
+    id: '设置分类',
+    file: 'App.vue',
+    re: /:data-tab="t\.id"/,
+    negate: true,
+    why: '（正向）分类页签要带 data-tab 锚点：被 v-if 收起来的控件在 DOM 里不存在，验收脚本只能靠点页签切过去',
+  },
+  {
+    id: '设置分类',
+    file: 'App.vue',
+    re: /const settingsTab = ref<SettingsTabId>\('pet'\)/,
+    negate: true,
+    why: '（正向）默认页必须是「桌宠」：四个验收脚本要在默认页上找自己的控件，改成别的页它们会集体失败',
+  },
 ]
 
 /** 需要读的文件（相对仓库根） */

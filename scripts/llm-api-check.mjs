@@ -135,6 +135,11 @@ await ev(`(() => { const c = document.querySelector('canvas'); const r = c.getBo
 await wait(400)
 await ev(`(() => { const g = [...document.querySelectorAll('.pie-container svg g')].find((el) => el.querySelector('circle'))
   g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
+// 设置面板现在按用途分了类，「模型 API」在「🤖 对话」那一页 —— 先切过去。
+// 必须切：被 v-if 收起来的页面在 DOM 里根本不存在，`waitFor` 等不到它。
+await ev(`(() => { const b = document.querySelector('.setting-tab[data-tab="chat"]')
+  if (b) b.dispatchEvent(new MouseEvent('click', { bubbles: true })); return true })()`)
+await wait(200)
 const appeared = await waitFor('.settings-panel .llm-provider')
 
 /**

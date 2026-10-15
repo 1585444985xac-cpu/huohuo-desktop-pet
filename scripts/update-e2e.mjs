@@ -128,6 +128,11 @@ const openSettingsPanel = async () => {
     const g = [...document.querySelectorAll('.pie-container svg g')].find((el) => el.querySelector('circle'))
     g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return true })()`)
   await wait(1500)
+  // 设置面板按用途分了类，「版本更新」在「⚙️ 系统」那一页 —— 先切过去。
+  // v-if 收起来的行在 DOM 里不存在，后面找 `.setting-label` 会直接找不到。
+  await evaluate(`(() => { const b = document.querySelector('.setting-tab[data-tab="system"]')
+    if (b) b.dispatchEvent(new MouseEvent('click', { bubbles: true })); return true })()`)
+  await wait(300)
 }
 /** 点设置面板里那个 ⟳ */
 const clickCheckButton = () => evaluate(`(() => {

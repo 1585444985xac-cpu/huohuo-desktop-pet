@@ -193,6 +193,11 @@ if (pairing?.code) {
 // 8) 设置面板里必须有那一栏（面板没打开就跳过，不误报）
 const panelOpen = await evaluate(`!!document.querySelector('.settings-panel')`)
 if (panelOpen) {
+  // 设置面板按用途分了类，「手机配对码」「手机远程控制」都在「📱 手机」那一页 —— 先切过去。
+  // v-if 收起来的行在 DOM 里不存在，不切的话这两条会假失败。
+  await evaluate(`(() => { const b = document.querySelector('.setting-tab[data-tab="phone"]')
+    if (b) b.dispatchEvent(new MouseEvent('click', { bubbles: true })); return true })()`)
+  await wait(300)
   const inPanel = await evaluate(`(() => {
     const rows = [...document.querySelectorAll('.settings-panel .setting-label')]
     return rows.some((e) => e.textContent.includes('手机配对码'))

@@ -560,6 +560,39 @@ function createPanelDrag(cfg: {
 /** 设置面板被拖到的位置；null = 还没拖过，跟随桌宠自动摆（默认） */
 const settingsPos = ref<{ left: number; top: number } | null>(null)
 
+// ─── 设置面板的分类页 ───
+//
+// 原来 17 行全堆在一起，而面板最高只有 560px（见 `settingsAutoStyle`），
+// 等于要滚三屏才找得到「模型密钥」或「网址快捷键」—— 按用途分成六类，每类一屏内看得完。
+type SettingsTabId = 'pet' | 'chat' | 'phone' | 'weather' | 'file' | 'system'
+const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string; hint: string }> = [
+  { id: 'pet', label: '🐾 桌宠', hint: '大小、性格、网址快捷键、程序位置、全局快捷键' },
+  { id: 'chat', label: '🤖 对话', hint: '模型 API 与语音播报' },
+  { id: 'phone', label: '📱 手机', hint: 'Telegram 与收件邮箱' },
+  { id: 'weather', label: '🌦 天气', hint: '天气地点与接口凭据' },
+  { id: 'file', label: '📁 文件', hint: '文件模式的项目记忆与处理能力' },
+  { id: 'system', label: '⚙️ 系统', hint: '版本更新与开机自启动' },
+]
+/**
+ * 默认停在「桌宠」，而且**刻意不记住上次选的那一页**：
+ * 验收脚本（`program-path-check` / `pie-menu-check` / `persona-check` / `hotkey-check`）
+ * 都要在默认页上找到自己的控件，记住上次的页会让它们随用户操作而时灵时不灵。
+ * 每类一屏内看得完，多点一下不值当为它牺牲脚本的确定性。
+ */
+const settingsTab = ref<SettingsTabId>('pet')
+
+function setSettingsTab(id: SettingsTabId) {
+  if (settingsTab.value === id) return
+  settingsTab.value = id
+  nextTick(() => {
+    // 换页后内容高低变了：滚动条回到顶部，免得停在上一次的中间位置、看着像"这一页是空的"
+    const body = document.querySelector('.settings-body') as HTMLElement | null
+    if (body) body.scrollTop = 0
+    // 面板高度变了，窗口的裁剪区域要跟着重算（不然多出来的那块点不到）
+    updateWindowRegion()
+  })
+}
+
 function settingsAutoStyle(): Record<string, string> | null {
   if (!model) return null
   const W = window.innerWidth
@@ -3575,10 +3608,25 @@ onUnmounted(async () => {
         <button class="chat-close" @click="toggleSettings()">✕</button>
       </div>
 
+      <!-- 分类页：17 行堆一起要滚三屏，按用途分成六类。
+           每颗按钮带 `data-tab`，是为了让 CDP 验收脚本能点它 ——
+           被 v-if 收起来的页面在 DOM 里根本不存在，脚本没法用选择器"找"到它。 -->
+      <div class="setting-tabs" role="tablist">
+        <button
+          v-for="t in SETTINGS_TABS"
+          :key="t.id"
+          class="setting-tab"
+          :class="{ active: settingsTab === t.id }"
+          :data-tab="t.id"
+          :title="t.hint"
+          @click.stop="setSettingsTab(t.id)"
+        >{{ t.label }}</button>
+      </div>
+
       <div class="settings-body">
         <!-- 0) 版本更新：放最上面（面板已经很长，放底部等于藏起来）
              更新源是**内置**的，所以这里不再给输入框 —— 只报告"当前版本 + 从哪更新 + 检查"。 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'system'">
           <label class="setting-label">
             ⬆️ 版本更新
             <span class="setting-value">{{ updateInfo.version || '…' }} · {{ formatBuildTime(updateInfo.build_epoch) }}</span>
@@ -3611,7 +3659,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 1) 🤖 模型 API：聊天 / 问答 / 文件三个模式共用这一份配置 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'chat'">
           <label class="setting-label">
             🤖 模型 API
             <span class="setting-value">{{ settings.llm_model_effective }}</span>
@@ -3708,7 +3756,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 性格：自定义人设。追加在提示词末尾并声明优先，硬规则不受影响 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'pet'">
           <label class="setting-label">
             🎭 性格
             <span class="setting-value">{{ (settings.persona || '').length }}/{{ settings.persona_max }}</span>
@@ -3741,7 +3789,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 2) 桌宠大小 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'pet'">
           <label class="setting-label">
             📏 桌宠大小
             <span class="setting-value">{{ Math.round(settings.pet_scale / settings.pet_scale_default * 100) }}%</span>
@@ -3760,7 +3808,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 3) 天气地点 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'weather'">
           <label class="setting-label">📍 天气地点</label>
           <input
             v-model="settings.weather_location"
@@ -3772,7 +3820,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 4) 豆包语音 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'chat'">
           <label class="setting-label">🔊 豆包语音（火山引擎）</label>
           <div class="setting-switch-row">
             <button
@@ -3812,7 +3860,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 5) Telegram 机器人（换 bot 只需要改这里） -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'phone'">
           <label class="setting-label">🤖 Telegram Bot Token</label>
           <div class="setting-key-row">
             <input
@@ -3843,7 +3891,7 @@ onUnmounted(async () => {
           紧接着一条「文件: …」就能让电脑执行命令。
           现在必须先拿到这个码，而它只显示在这台电脑的屏幕上。
         -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'phone'">
           <label class="setting-label">
             🔐 手机配对码
             <span class="setting-value">{{ tgChats.length > 0 ? '已绑定' : '待配对' }}</span>
@@ -3875,7 +3923,7 @@ onUnmounted(async () => {
           本职工作），但写文件 / 发文件 / 执行命令默认拒绝。
           注意"允许执行命令"即使打开，每条命令仍然会在电脑上弹窗等你点确认。
         -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'phone'">
           <label class="setting-label">📱 手机远程控制</label>
           <div class="setting-hint">
             手机上的请求默认**只能看、不能改**。下面三项是主人主动放权，默认全关。
@@ -3899,7 +3947,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 6) 收件邮箱（原来地址和授权码是写死在源码里的） -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'phone'">
           <label class="setting-label">
             📧 收件邮箱
             <span class="setting-value">{{ settings.has_email_config ? '已启用' : '未配置' }}</span>
@@ -3973,7 +4021,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 7) 文件模式的项目记忆 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'file'">
           <label class="setting-label">
             📁 文件模式的项目记忆
             <span class="setting-value">{{ projectMemoryCount }} 条</span>
@@ -3996,7 +4044,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 8) 文件模式的处理能力（模型 / 步数上限） -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'file'">
           <label class="setting-label">🧠 文件模式的处理能力</label>
           <div class="setting-hint">
             模型在「🤖 模型 API」里统一设置（三个模式共用），这里只调它一次能干多少步
@@ -4023,7 +4071,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 9) 开机自启 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'system'">
           <label class="setting-label">🚀 开机自启动</label>
           <div class="setting-switch-row">
             <button
@@ -4054,7 +4102,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 环形菜单的三格网址快捷键 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'pet'">
           <label class="setting-label">🔗 网址快捷键<span class="setting-value">环形菜单第 4/5/6 格</span></label>
           <div v-for="(l, i) in settings.links" :key="'link' + i" class="link-row">
             <input
@@ -4085,7 +4133,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 本地程序位置：QQ / 酷狗（支持把桌面快捷方式直接拖进来） -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'pet'">
           <label class="setting-label">🖥 程序位置<span class="setting-value">留空 = 自动查找</span></label>
           <div class="link-row">
             <span class="path-name">QQ</span>
@@ -4128,7 +4176,7 @@ onUnmounted(async () => {
         </div>
 
         <!-- 全局快捷键：点一下框再按组合键就录进去 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'pet'">
           <label class="setting-label">⌨️ 全局快捷键<span class="setting-value">留空 = 不启用</span></label>
           <div
             v-for="hk in [
@@ -4180,7 +4228,7 @@ onUnmounted(async () => {
           </div>
         </div>
         <!-- 和风天气凭据：程序里不再内置，谁的额度谁自己填 -->
-        <div class="setting-row">
+<div class="setting-row" v-if="settingsTab === 'weather'">
           <label class="setting-label">
             🌦 天气接口
             <span class="setting-value">{{ settings.has_qweather ? '已配置' : '未配置（悬浮弹窗不显示天气）' }}</span>
@@ -4465,6 +4513,18 @@ canvas { display: block; width: 100%; height: 100%; pointer-events: auto; }
   flex: 1; overflow-y: auto; padding: 4px 14px 10px;
   scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.2) transparent;
 }
+/* 分类页签：六颗等宽按钮铺满一行（面板宽 340，去掉左右内边距刚好） */
+.setting-tabs {
+  display: flex; gap: 2px; padding: 0 10px 6px;
+  border-bottom: 1px solid rgba(120,200,255,0.18);
+}
+.setting-tab {
+  flex: 1; min-width: 0; padding: 5px 2px; font-size: 11px; white-space: nowrap;
+  background: rgba(255,255,255,0.05); color: #9fc4ea; border: none; border-radius: 6px;
+  cursor: pointer; font-family: inherit; transition: background 0.15s, color 0.15s;
+}
+.setting-tab:hover { background: rgba(255,255,255,0.12); color: #fff; }
+.setting-tab.active { background: rgba(120,200,255,0.28); color: #fff; font-weight: 600; }
 .settings-body::-webkit-scrollbar { width: 4px; }
 .settings-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 2px; }
 .setting-row { margin-bottom: 14px; }
